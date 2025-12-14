@@ -13,6 +13,38 @@ SOCKET_PATH = "/tmp/claude-island.sock"
 TIMEOUT_SECONDS = 300  # 5 minutes for permission decisions
 
 
+def get_git_branch(cwd):
+    """Get the current git branch for a directory (supports worktrees)"""
+    if not cwd:
+        return None
+    try:
+        git_path = os.path.join(cwd, ".git")
+
+        # Check if .git is a file (worktree) or directory (regular repo)
+        if os.path.isfile(git_path):
+            # Worktree: .git file contains "gitdir: /path/to/git/dir"
+            with open(git_path, "r") as f:
+                content = f.read().strip()
+            if content.startswith("gitdir: "):
+                git_dir = content[8:]  # Remove "gitdir: "
+                head_path = os.path.join(git_dir, "HEAD")
+            else:
+                return None
+        else:
+            # Regular repo
+            head_path = os.path.join(git_path, "HEAD")
+
+        with open(head_path, "r") as f:
+            content = f.read().strip()
+
+        # Content is like: "ref: refs/heads/main"
+        if content.startswith("ref: refs/heads/"):
+            return content[16:]  # Remove "ref: refs/heads/"
+        return None  # Detached HEAD
+    except (OSError, IOError):
+        return None
+
+
 def get_tty():
     """Get the TTY of the Claude process (parent)"""
     import subprocess
@@ -85,6 +117,7 @@ def main():
     # Get process info
     claude_pid = os.getppid()
     tty = get_tty()
+    git_branch = get_git_branch(cwd)
 
     # Build state object
     state = {
@@ -93,6 +126,7 @@ def main():
         "event": event,
         "pid": claude_pid,
         "tty": tty,
+        "git_branch": git_branch,
     }
 
     # Map events to status

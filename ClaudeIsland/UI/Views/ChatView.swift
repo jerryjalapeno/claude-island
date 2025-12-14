@@ -422,7 +422,6 @@ struct ChatView: View {
     /// Bar for interactive tools like AskUserQuestion that need terminal input
     private var interactivePromptBar: some View {
         ChatInteractivePromptBar(
-            isInTmux: session.isInTmux,
             onGoToTerminal: { focusTerminal() }
         )
     }
@@ -983,7 +982,6 @@ struct InterruptedMessageView: View {
 
 /// Bar for interactive tools like AskUserQuestion that need terminal input
 struct ChatInteractivePromptBar: View {
-    let isInTmux: Bool
     let onGoToTerminal: () -> Void
 
     @State private var showContent = false
@@ -1006,11 +1004,9 @@ struct ChatInteractivePromptBar: View {
 
             Spacer()
 
-            // Terminal button on right (similar to Allow button)
+            // Terminal button on right (always enabled with AppKit fallback)
             Button {
-                if isInTmux {
-                    onGoToTerminal()
-                }
+                onGoToTerminal()
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "terminal")
@@ -1018,10 +1014,10 @@ struct ChatInteractivePromptBar: View {
                     Text("Terminal")
                         .font(.system(size: 13, weight: .medium))
                 }
-                .foregroundColor(isInTmux ? .black : .white.opacity(0.4))
+                .foregroundColor(.black)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                .background(isInTmux ? Color.white.opacity(0.95) : Color.white.opacity(0.1))
+                .background(Color.white.opacity(0.95))
                 .clipShape(Capsule())
             }
             .buttonStyle(.plain)

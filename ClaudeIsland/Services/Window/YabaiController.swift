@@ -6,6 +6,10 @@
 //
 
 import Foundation
+import os.log
+
+/// Logger for yabai controller
+private let logger = Logger(subsystem: "com.claudeisland", category: "YabaiController")
 
 /// Controller for yabai window management
 actor YabaiController {
@@ -15,23 +19,57 @@ actor YabaiController {
 
     // MARK: - Public API
 
-    /// Focus the terminal window for a given Claude PID (tmux only)
+    /// Focus the terminal window for a given Claude PID
+    /// Uses yabai if available, falls back to AppKit
     func focusWindow(forClaudePid claudePid: Int) async -> Bool {
-        guard await WindowFinder.shared.isYabaiAvailable() else {
-            return false
+        // Try yabai first for tmux sessions (more precise window targeting)
+        if await WindowFinder.shared.isYabaiAvailable() {
+            let windows = await WindowFinder.shared.getAllWindows()
+            let tree = ProcessTreeBuilder.shared.buildTree()
+
+            // Check if this is a tmux session
+            if ProcessTreeBuilder.shared.isInTmux(pid: claudePid, tree: tree) {
+                let result = await focusTmuxInstance(claudePid: claudePid, tree: tree, windows: windows)
+                if result {
+                    return true
+                }
+            }
+
+            // Try direct terminal focus via yabai
+            if let terminalPid = ProcessTreeBuilder.shared.findTerminalPid(forProcess: claudePid, tree: tree) {
+                if let window = windows.first(where: { $0.pid == terminalPid }) {
+                    let result = await WindowFocuser.shared.focusWindow(id: window.id)
+                    if result {
+                        return true
+                    }
+                }
+            }
         }
 
-        let windows = await WindowFinder.shared.getAllWindows()
-        let tree = ProcessTreeBuilder.shared.buildTree()
-
-        return await focusTmuxInstance(claudePid: claudePid, tree: tree, windows: windows)
+        // Fall back to AppKit (works without yabai)
+        logger.debug("Falling back to AppKit focus for PID \(claudePid)")
+        return await AppKitWindowFocuser.shared.focusTerminal(forClaudePid: claudePid)
     }
 
-    /// Focus the terminal window for a given working directory (tmux only, fallback)
+    /// Focus the terminal window for a given working directory
+    /// Uses yabai if available, falls back to AppKit
     func focusWindow(forWorkingDirectory workingDirectory: String) async -> Bool {
-        guard await WindowFinder.shared.isYabaiAvailable() else { return false }
+        // Try yabai first
+        if await WindowFinder.shared.isYabaiAvailable() {
+            let result = await focusWindow(forWorkingDir: workingDirectory)
+            if result {
+                return true
+            }
+        }
 
-        return await focusWindow(forWorkingDir: workingDirectory)
+        // Fall back to AppKit
+        logger.debug("Falling back to AppKit focus for cwd: \(workingDirectory)")
+        return await AppKitWindowFocuser.shared.focusTerminal(forWorkingDirectory: workingDirectory)
+    }
+
+    /// Check if window focusing is available (always true now with AppKit fallback)
+    func isFocusAvailable() async -> Bool {
+        return true
     }
 
     // MARK: - Private Implementation

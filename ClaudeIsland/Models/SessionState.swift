@@ -16,6 +16,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
     let sessionId: String
     let cwd: String
     let projectName: String
+    var gitBranch: String?
 
     // MARK: - Instance Metadata
 
@@ -68,6 +69,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         sessionId: String,
         cwd: String,
         projectName: String? = nil,
+        gitBranch: String? = nil,
         pid: Int? = nil,
         tty: String? = nil,
         isInTmux: Bool = false,
@@ -86,6 +88,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.sessionId = sessionId
         self.cwd = cwd
         self.projectName = projectName ?? URL(fileURLWithPath: cwd).lastPathComponent
+        self.gitBranch = gitBranch
         self.pid = pid
         self.tty = tty
         self.isInTmux = isInTmux
@@ -124,9 +127,25 @@ struct SessionState: Equatable, Identifiable, Sendable {
         return sessionId
     }
 
-    /// Display title: summary > first user message > project name
+    /// Project/branch label for the pill: "project/branch" or "project"
+    var projectBranchLabel: String {
+        if let branch = gitBranch {
+            return "\(projectName)/\(branch)"
+        }
+        return projectName
+    }
+
+    /// Detail text (summary or first message), if any
+    var titleDetail: String? {
+        conversationInfo.summary ?? conversationInfo.firstUserMessage
+    }
+
+    /// Full display title for other uses
     var displayTitle: String {
-        conversationInfo.summary ?? conversationInfo.firstUserMessage ?? projectName
+        if let detail = titleDetail {
+            return "\(projectBranchLabel): \(detail)"
+        }
+        return projectBranchLabel
     }
 
     /// Best hint for matching window title

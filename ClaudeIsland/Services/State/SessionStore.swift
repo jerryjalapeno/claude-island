@@ -133,6 +133,9 @@ actor SessionStore {
         if let tty = event.tty {
             session.tty = tty.replacingOccurrences(of: "/dev/", with: "")
         }
+        if let gitBranch = event.gitBranch {
+            session.gitBranch = gitBranch
+        }
         session.lastActivity = Date()
 
         if event.status == "ended" {
@@ -174,6 +177,7 @@ actor SessionStore {
             sessionId: event.sessionId,
             cwd: event.cwd,
             projectName: URL(fileURLWithPath: event.cwd).lastPathComponent,
+            gitBranch: event.gitBranch,
             pid: event.pid,
             tty: event.tty?.replacingOccurrences(of: "/dev/", with: ""),
             isInTmux: false,  // Will be updated
