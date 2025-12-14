@@ -12,6 +12,7 @@ struct TerminalColors {
     static let amber = Color(red: 1.0, green: 0.7, blue: 0.0)
     static let red = Color(red: 1.0, green: 0.3, blue: 0.3)
     static let cyan = Color(red: 0.0, green: 0.8, blue: 0.8)
+    static let compact = Color(red: 0.529, green: 0.686, blue: 1.0)  // #87afff - compacting state
     static let blue = Color(red: 0.4, green: 0.6, blue: 1.0)
     static let magenta = Color(red: 0.8, green: 0.4, blue: 0.8)
     static let dim = Color.white.opacity(0.4)

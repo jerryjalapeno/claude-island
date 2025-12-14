@@ -48,16 +48,35 @@ struct SessionState: Equatable, Identifiable, Sendable {
 
     var conversationInfo: ConversationInfo
 
+    // MARK: - Todo Status (from ~/.claude/todos/)
+
+    /// Current in-progress todo's activeForm text (e.g., "Adding compacting color")
+    var currentTodoActiveForm: String?
+
     // MARK: - Clear Reconciliation
 
     /// When true, the next file update should reconcile chatItems with parser state
     /// This removes pre-/clear items that no longer exist in the JSONL
     var needsClearReconciliation: Bool
 
+    // MARK: - Permission Socket State
+
+    /// Whether there's an open socket waiting for permission response
+    /// This is distinct from phase - phase can be waitingForApproval but socket may be closed
+    /// (e.g., if tool was auto-approved via terminal). Only show approval UI when socket is open.
+    var hasPendingSocket: Bool
+
+    /// The tool name for the pending socket (stored separately from phase for resilience)
+    var pendingSocketToolName: String?
+
+    /// The tool use ID for the pending socket
+    var pendingSocketToolId: String?
+
     // MARK: - Timestamps
 
     var lastActivity: Date
     var createdAt: Date
+    var turnEndTime: Date?  // Set when turn completes (phase -> waitingForInput)
 
     // MARK: - Identifiable
 
@@ -79,15 +98,22 @@ struct SessionState: Equatable, Identifiable, Sendable {
         subagentState: SubagentState = SubagentState(),
         conversationInfo: ConversationInfo = ConversationInfo(
             summary: nil, lastMessage: nil, lastMessageRole: nil,
-            lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil
+            lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil,
+            turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil,
+            isThinking: false, lastThinkingText: nil
         ),
+        currentTodoActiveForm: String? = nil,
         needsClearReconciliation: Bool = false,
+        hasPendingSocket: Bool = false,
+        pendingSocketToolName: String? = nil,
+        pendingSocketToolId: String? = nil,
         lastActivity: Date = Date(),
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        turnEndTime: Date? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
-        self.projectName = projectName ?? URL(fileURLWithPath: cwd).lastPathComponent
+        self.projectName = projectName ?? GitUtils.getRepoName(cwd: cwd)
         self.gitBranch = gitBranch
         self.pid = pid
         self.tty = tty
@@ -97,9 +123,14 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.toolTracker = toolTracker
         self.subagentState = subagentState
         self.conversationInfo = conversationInfo
+        self.currentTodoActiveForm = currentTodoActiveForm
         self.needsClearReconciliation = needsClearReconciliation
+        self.hasPendingSocket = hasPendingSocket
+        self.pendingSocketToolName = pendingSocketToolName
+        self.pendingSocketToolId = pendingSocketToolId
         self.lastActivity = lastActivity
         self.createdAt = createdAt
+        self.turnEndTime = turnEndTime
     }
 
     // MARK: - Derived Properties
@@ -154,13 +185,15 @@ struct SessionState: Equatable, Identifiable, Sendable {
     }
 
     /// Pending tool name if waiting for approval
+    /// Prefers the socket-stored value (more reliable) over phase-derived value
     var pendingToolName: String? {
-        activePermission?.toolName
+        pendingSocketToolName ?? activePermission?.toolName
     }
 
     /// Pending tool use ID
+    /// Prefers the socket-stored value (more reliable) over phase-derived value
     var pendingToolId: String? {
-        activePermission?.toolUseId
+        pendingSocketToolId ?? activePermission?.toolUseId
     }
 
     /// Formatted pending tool input for display
@@ -201,6 +234,120 @@ struct SessionState: Equatable, Identifiable, Sendable {
     /// Whether the session can be interacted with
     var canInteract: Bool {
         phase.needsAttention
+    }
+
+    // MARK: - Live Activity Properties
+
+    /// Currently running tool (if any) - for status display
+    var currentToolInProgress: ToolInProgress? {
+        // Return the most recent tool in progress
+        toolTracker.inProgress.values.max(by: { $0.startTime < $1.startTime })
+    }
+
+    /// Active subagent/task description (if any)
+    var activeSubagentDescription: String? {
+        // Get the most recent active task's description
+        guard let mostRecentTask = subagentState.activeTasks.values.max(by: { $0.startTime < $1.startTime }) else {
+            return nil
+        }
+        return mostRecentTask.description
+    }
+
+    /// Active subagent type (e.g., "Explore", "Plan", "code-reviewer")
+    var activeSubagentType: String? {
+        guard let mostRecentTask = subagentState.activeTasks.values.max(by: { $0.startTime < $1.startTime }) else {
+            return nil
+        }
+        return mostRecentTask.agentType
+    }
+
+    /// Whether there's an active subagent running
+    var hasActiveSubagent: Bool {
+        subagentState.hasActiveSubagent
+    }
+
+    /// Get the current subagent's most recent tool (if any)
+    var subagentCurrentTool: SubagentToolCall? {
+        guard let mostRecentTask = subagentState.activeTasks.values.max(by: { $0.startTime < $1.startTime }) else {
+            return nil
+        }
+        // Return the most recent running tool, or just the last one
+        return mostRecentTask.subagentTools.last(where: { $0.status == .running }) ?? mostRecentTask.subagentTools.last
+    }
+
+    // MARK: - Turn Stats
+
+    /// When the current turn started
+    var turnStartTime: Date? {
+        conversationInfo.turnStartTime
+    }
+
+    /// Elapsed time for current turn (uses turnEndTime if turn completed)
+    var turnElapsedSeconds: TimeInterval? {
+        guard let start = turnStartTime else { return nil }
+        let end = turnEndTime ?? Date()
+        return end.timeIntervalSince(start)
+    }
+
+    /// Total tokens for current turn (input + output)
+    var turnTotalTokens: Int? {
+        let input = conversationInfo.turnInputTokens ?? 0
+        let output = conversationInfo.turnOutputTokens ?? 0
+        guard input > 0 || output > 0 else { return nil }
+        return input + output
+    }
+
+    /// Output tokens for current turn
+    var turnOutputTokens: Int? {
+        conversationInfo.turnOutputTokens
+    }
+
+    /// Whether Claude is currently thinking
+    var isThinking: Bool {
+        conversationInfo.isThinking
+    }
+
+    /// The current thinking text (for status line display)
+    var lastThinkingText: String? {
+        conversationInfo.lastThinkingText
+    }
+
+    /// Input tokens for current turn
+    var turnInputTokens: Int? {
+        conversationInfo.turnInputTokens
+    }
+
+    /// Formatted turn stats string (e.g., "12s · 1.5k")
+    var turnStatsString: String? {
+        var parts: [String] = []
+
+        // Elapsed time (whole seconds)
+        if let elapsed = turnElapsedSeconds, elapsed >= 1 {
+            let secs = Int(elapsed)
+            if secs < 60 {
+                parts.append("\(secs)s")
+            } else {
+                let mins = secs / 60
+                let remainingSecs = secs % 60
+                parts.append("\(mins)m \(remainingSecs)s")
+            }
+        }
+
+        // Total tokens (input + output combined)
+        if let totalTokens = turnTotalTokens, totalTokens > 0 {
+            parts.append(formatTokenCount(totalTokens))
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// Format token count for display
+    private func formatTokenCount(_ tokens: Int) -> String {
+        if tokens >= 1000 {
+            return String(format: "%.1fk", Double(tokens) / 1000.0)
+        } else {
+            return "\(tokens)"
+        }
     }
 }
 
@@ -300,12 +447,13 @@ struct SubagentState: Equatable, Sendable {
     }
 
     /// Start tracking a Task tool
-    nonisolated mutating func startTask(taskToolId: String, description: String? = nil) {
+    nonisolated mutating func startTask(taskToolId: String, description: String? = nil, agentType: String? = nil) {
         activeTasks[taskToolId] = TaskContext(
             taskToolId: taskToolId,
             startTime: Date(),
             agentId: nil,
             description: description,
+            agentType: agentType,
             subagentTools: []
         )
     }
@@ -360,5 +508,6 @@ struct TaskContext: Equatable, Sendable {
     let startTime: Date
     var agentId: String?
     var description: String?
+    var agentType: String?  // e.g., "Explore", "Plan", "code-reviewer"
     var subagentTools: [SubagentToolCall]
 }

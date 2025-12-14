@@ -438,7 +438,7 @@ class HookSocketServer {
                 return
             }
 
-            logger.debug("Permission request - keeping socket open for \(event.sessionId.prefix(8), privacy: .public) tool:\(toolUseId.prefix(12), privacy: .public)")
+            logger.info("Permission request - keeping socket open for \(event.sessionId.prefix(8), privacy: .public) tool:\(event.tool ?? "?", privacy: .public) id:\(toolUseId.prefix(12), privacy: .public)")
 
             let updatedEvent = HookEvent(
                 sessionId: event.sessionId,

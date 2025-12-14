@@ -12,10 +12,61 @@ import os.log
 struct ConversationInfo: Equatable {
     let summary: String?
     let lastMessage: String?
-    let lastMessageRole: String?  // "user", "assistant", or "tool"
+    let lastMessageRole: String?  // "user", "assistant", "tool", or "thinking"
     let lastToolName: String?  // Tool name if lastMessageRole is "tool"
     let firstUserMessage: String?  // Fallback title when no summary
     let lastUserMessageDate: Date?  // Timestamp of last user message (for stable sorting)
+
+    // Turn stats (for current/last turn)
+    let turnStartTime: Date?  // When the current turn started (last user message)
+    let turnInputTokens: Int?  // Input tokens for current turn
+    let turnOutputTokens: Int?  // Output tokens for current turn
+    let turnCacheReadTokens: Int?  // Cache read tokens for current turn
+
+    // Thinking state
+    let isThinking: Bool  // Whether the most recent activity was thinking
+    let lastThinkingText: String?  // The actual thinking text (for status line display)
+}
+
+// MARK: - Todo File Parser
+
+/// Parses Claude Code's todo files to get the current in-progress task
+enum TodoFileParser {
+    /// Parse the todos file for a session and return the activeForm of the in-progress item
+    static func parseActiveForm(sessionId: String) -> String? {
+        let todosDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/todos")
+
+        // Primary file format: {sessionId}-agent-{sessionId}.json
+        let primaryPath = todosDir.appendingPathComponent("\(sessionId)-agent-\(sessionId).json")
+
+        // Try primary path first
+        if let activeForm = parseActiveFormFrom(url: primaryPath) {
+            return activeForm
+        }
+
+        // Fallback: try {sessionId}.json format
+        let fallbackPath = todosDir.appendingPathComponent("\(sessionId).json")
+        return parseActiveFormFrom(url: fallbackPath)
+    }
+
+    private static func parseActiveFormFrom(url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let todos = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return nil
+        }
+
+        // Find the in-progress item
+        for todo in todos {
+            if let status = todo["status"] as? String,
+               status == "in_progress",
+               let activeForm = todo["activeForm"] as? String {
+                return activeForm
+            }
+        }
+
+        return nil
+    }
 }
 
 actor ConversationParser {
@@ -79,7 +130,7 @@ actor ConversationParser {
         guard fileManager.fileExists(atPath: sessionFile),
               let attrs = try? fileManager.attributesOfItem(atPath: sessionFile),
               let modDate = attrs[.modificationDate] as? Date else {
-            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil)
+            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil, turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil, isThinking: false, lastThinkingText: nil)
         }
 
         if let cached = cache[sessionFile], cached.modificationDate == modDate {
@@ -88,7 +139,7 @@ actor ConversationParser {
 
         guard let data = fileManager.contents(atPath: sessionFile),
               let content = String(data: data, encoding: .utf8) else {
-            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil)
+            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil, turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil, isThinking: false, lastThinkingText: nil)
         }
 
         let info = parseContent(content)
@@ -107,6 +158,14 @@ actor ConversationParser {
         var lastToolName: String?
         var firstUserMessage: String?
         var lastUserMessageDate: Date?
+
+        // Turn stats (accumulated since last user message)
+        var turnStartTime: Date?
+        var turnInputTokens: Int = 0
+        var turnOutputTokens: Int = 0
+        var turnCacheReadTokens: Int = 0
+        var isThinking: Bool = false  // Track if most recent activity is thinking
+        var lastThinkingText: String?  // The actual thinking text
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -131,7 +190,84 @@ actor ConversationParser {
             }
         }
 
-        var foundLastUserMessage = false
+        // Track the most recent turn: find last user message, accumulate tokens
+        // Key fix: Each message is written multiple times during streaming, so we track
+        // by message.id and always use the LATEST (highest) token count per message
+        var foundTurnStart = false
+        var messageTokens: [String: (input: Int, output: Int, cacheRead: Int)] = [:]
+
+        // Iterate forward to find turn start and collect final token counts
+        var turnStartIndex = 0
+        for (index, line) in lines.enumerated() {
+            guard let lineData = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                continue
+            }
+
+            let type = json["type"] as? String
+            let isMeta = json["isMeta"] as? Bool ?? false
+
+            // Find the last real user message (turn start)
+            if type == "user" && !isMeta {
+                if let message = json["message"] as? [String: Any] {
+                    if let msgContent = message["content"] as? String {
+                        if !msgContent.hasPrefix("<command-name>") && !msgContent.hasPrefix("<local-command") && !msgContent.hasPrefix("Caveat:") {
+                            turnStartIndex = index
+                            if let timestampStr = json["timestamp"] as? String {
+                                turnStartTime = formatter.date(from: timestampStr)
+                                lastUserMessageDate = turnStartTime
+                            }
+                        }
+                    } else if let contentArray = message["content"] as? [[String: Any]] {
+                        // Skip tool results (they're user type but not real user input)
+                        let hasToolResult = contentArray.contains { $0["type"] as? String == "tool_result" }
+                        if !hasToolResult {
+                            turnStartIndex = index
+                            if let timestampStr = json["timestamp"] as? String {
+                                turnStartTime = formatter.date(from: timestampStr)
+                                lastUserMessageDate = turnStartTime
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now collect token usage from turn start to end
+        // Each message may have multiple entries (streaming), so we keep the LAST (final) one
+        for line in lines.dropFirst(turnStartIndex) {
+            guard let lineData = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                continue
+            }
+
+            let type = json["type"] as? String
+            let isMeta = json["isMeta"] as? Bool ?? false
+
+            if type == "assistant" && !isMeta {
+                if let message = json["message"] as? [String: Any],
+                   let usage = message["usage"] as? [String: Any],
+                   let messageId = message["id"] as? String {
+                    // Always update - last entry wins (streaming updates)
+                    // Note: We use just input_tokens (not cache_creation) to match Claude Code's display
+                    let inputTokens = usage["input_tokens"] as? Int ?? 0
+                    let cacheRead = usage["cache_read_input_tokens"] as? Int ?? 0
+                    let outputTokens = usage["output_tokens"] as? Int ?? 0
+                    messageTokens[messageId] = (inputTokens, outputTokens, cacheRead)
+                }
+            }
+        }
+
+        // Sum up final token counts per message
+        for (_, tokens) in messageTokens {
+            turnInputTokens += tokens.input
+            turnOutputTokens += tokens.output
+            turnCacheReadTokens += tokens.cacheRead
+        }
+
+        // Now iterate in reverse to find last message and summary (most recent first)
+        var foundMostRecentAssistant = false  // Track if we've processed the most recent assistant entry
+
         for line in lines.reversed() {
             guard let lineData = line.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
@@ -139,17 +275,40 @@ actor ConversationParser {
             }
 
             let type = json["type"] as? String
+            let isMeta = json["isMeta"] as? Bool ?? false
 
             if lastMessage == nil {
                 if type == "user" || type == "assistant" {
-                    let isMeta = json["isMeta"] as? Bool ?? false
                     if !isMeta, let message = json["message"] as? [String: Any] {
+                        let isFirstAssistant = !foundMostRecentAssistant && type == "assistant"
+                        if type == "assistant" {
+                            foundMostRecentAssistant = true
+                        }
+
                         if let msgContent = message["content"] as? String {
                             if !msgContent.hasPrefix("<command-name>") && !msgContent.hasPrefix("<local-command") && !msgContent.hasPrefix("Caveat:") {
                                 lastMessage = msgContent
                                 lastMessageRole = type
+                                if isFirstAssistant {
+                                    isThinking = false
+                                }
                             }
                         } else if let contentArray = message["content"] as? [[String: Any]] {
+                            // For the most recent assistant message, check if thinking is the LAST block
+                            // This indicates Claude is currently thinking (thinking appears at end during streaming)
+                            if isFirstAssistant {
+                                // Check what the last block type is
+                                if let lastBlock = contentArray.last,
+                                   let lastBlockType = lastBlock["type"] as? String {
+                                    isThinking = (lastBlockType == "thinking")
+                                    // Capture the thinking text for status line display
+                                    if isThinking, let thinkingText = lastBlock["thinking"] as? String {
+                                        lastThinkingText = thinkingText
+                                    }
+                                }
+                            }
+
+                            // Now find text/tool content for display (reverse to get most recent)
                             for block in contentArray.reversed() {
                                 let blockType = block["type"] as? String
                                 if blockType == "tool_use" {
@@ -166,21 +325,8 @@ actor ConversationParser {
                                         break
                                     }
                                 }
+                                // Skip thinking blocks for lastMessage - they're not displayable content
                             }
-                        }
-                    }
-                }
-            }
-
-            if !foundLastUserMessage && type == "user" {
-                let isMeta = json["isMeta"] as? Bool ?? false
-                if !isMeta, let message = json["message"] as? [String: Any] {
-                    if let msgContent = message["content"] as? String {
-                        if !msgContent.hasPrefix("<command-name>") && !msgContent.hasPrefix("<local-command") && !msgContent.hasPrefix("Caveat:") {
-                            if let timestampStr = json["timestamp"] as? String {
-                                lastUserMessageDate = formatter.date(from: timestampStr)
-                            }
-                            foundLastUserMessage = true
                         }
                     }
                 }
@@ -190,7 +336,8 @@ actor ConversationParser {
                 summary = summaryText
             }
 
-            if summary != nil && lastMessage != nil && foundLastUserMessage {
+            // Early exit once we have everything
+            if summary != nil && lastMessage != nil {
                 break
             }
         }
@@ -201,7 +348,13 @@ actor ConversationParser {
             lastMessageRole: lastMessageRole,
             lastToolName: lastToolName,
             firstUserMessage: firstUserMessage,
-            lastUserMessageDate: lastUserMessageDate
+            lastUserMessageDate: lastUserMessageDate,
+            turnStartTime: turnStartTime,
+            turnInputTokens: turnInputTokens > 0 ? turnInputTokens : nil,
+            turnOutputTokens: turnOutputTokens > 0 ? turnOutputTokens : nil,
+            turnCacheReadTokens: turnCacheReadTokens > 0 ? turnCacheReadTokens : nil,
+            isThinking: isThinking,
+            lastThinkingText: lastThinkingText
         )
     }
 
@@ -444,6 +597,14 @@ actor ConversationParser {
     /// Reset incremental state for a session (call when reloading)
     func resetState(for sessionId: String) {
         incrementalState.removeValue(forKey: sessionId)
+    }
+
+    /// Clear all cached data for a session (call when session ends)
+    func clearSession(sessionId: String, cwd: String) {
+        incrementalState.removeValue(forKey: sessionId)
+        let sessionFile = Self.sessionFilePath(sessionId: sessionId, cwd: cwd)
+        cache.removeValue(forKey: sessionFile)
+        Self.logger.debug("Cleared parser state for session \(sessionId.prefix(8), privacy: .public)")
     }
 
     /// Check if a /clear command was detected during the last parse

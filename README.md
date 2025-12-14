@@ -50,6 +50,13 @@ Claude Island uses Mixpanel to collect anonymous usage data:
 
 No personal data or conversation content is collected.
 
+## Design Notes
+
+### Color Palette
+- **Compact state**: #87afff (text/spinner)
+- **Compact text highlight**: #afd7ff
+- **Orange text highlight**: #ffaf88
+
 ## License
 
 Apache 2.0

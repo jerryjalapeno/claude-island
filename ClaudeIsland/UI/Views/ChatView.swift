@@ -42,13 +42,14 @@ struct ChatView: View {
     }
 
     /// Whether we're waiting for approval
+    /// Uses hasPendingSocket as the source of truth (not phase)
     private var isWaitingForApproval: Bool {
-        session.phase.isWaitingForApproval
+        session.hasPendingSocket
     }
 
     /// Extract the tool name if waiting for approval
     private var approvalTool: String? {
-        session.phase.approvalToolName
+        session.pendingToolName
     }
 
     
@@ -688,11 +689,20 @@ struct ToolCallView: View {
                         }
                     }
 
-                // Tool name (formatted for MCP tools)
-                Text(MCPToolFormatter.formatToolName(tool.name))
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(textColor)
+                // Tool name (formatted for MCP tools) - shimmer when waiting for approval
+                if tool.status == .waitingForApproval {
+                    ShimmerText(
+                        text: MCPToolFormatter.formatToolName(tool.name),
+                        font: .system(size: 12, weight: .medium),
+                        color: .orange
+                    )
                     .fixedSize()
+                } else {
+                    Text(MCPToolFormatter.formatToolName(tool.name))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(textColor)
+                        .fixedSize()
+                }
 
                 if tool.name == "Task" && !tool.subagentTools.isEmpty {
                     let taskDesc = tool.input["description"] ?? "Running agent..."

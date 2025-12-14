@@ -148,13 +148,27 @@ actor SessionStore {
 
         if session.phase.canTransition(to: newPhase) {
             session.phase = newPhase
+
+            // When turn ends (waiting for input), clear todo
+            // Note: turnEndTime is set in processFileUpdate when truly idle (not thinking, no tools)
+            if case .waitingForInput = newPhase {
+                session.currentTodoActiveForm = nil
+            }
+            // When a new turn starts (processing), clear end time
+            if case .processing = newPhase {
+                session.turnEndTime = nil
+            }
         } else {
             Self.logger.debug("Invalid transition: \(String(describing: session.phase), privacy: .public) -> \(String(describing: newPhase), privacy: .public), ignoring")
         }
 
         if event.event == "PermissionRequest", let toolUseId = event.toolUseId {
-            Self.logger.debug("Setting tool \(toolUseId.prefix(12), privacy: .public) status to waitingForApproval")
+            Self.logger.info("PermissionRequest received for tool \(event.tool ?? "?", privacy: .public) id:\(toolUseId.prefix(12), privacy: .public) - setting hasPendingSocket=true")
             updateToolStatus(in: &session, toolId: toolUseId, status: .waitingForApproval)
+            // Mark that there's an open socket waiting for response
+            session.hasPendingSocket = true
+            session.pendingSocketToolName = event.tool
+            session.pendingSocketToolId = toolUseId
         }
 
         processToolTracking(event: event, session: &session)
@@ -176,7 +190,7 @@ actor SessionStore {
         SessionState(
             sessionId: event.sessionId,
             cwd: event.cwd,
-            projectName: URL(fileURLWithPath: event.cwd).lastPathComponent,
+            projectName: GitUtils.getRepoName(cwd: event.cwd),
             gitBranch: event.gitBranch,
             pid: event.pid,
             tty: event.tty?.replacingOccurrences(of: "/dev/", with: ""),
@@ -233,6 +247,14 @@ actor SessionStore {
         case "PostToolUse":
             if let toolUseId = event.toolUseId {
                 session.toolTracker.completeTool(id: toolUseId, success: true)
+                // Only clear pending socket state if this PostToolUse is for the pending tool
+                // Otherwise a different tool's completion would incorrectly clear the socket
+                if session.hasPendingSocket && session.pendingSocketToolId == toolUseId {
+                    Self.logger.info("PostToolUse clearing hasPendingSocket for tool \(event.tool ?? "?", privacy: .public) id:\(toolUseId.prefix(12), privacy: .public)")
+                    session.hasPendingSocket = false
+                    session.pendingSocketToolName = nil
+                    session.pendingSocketToolId = nil
+                }
                 // Update chatItem status - tool completed (possibly approved via terminal)
                 // Only update if still waiting for approval or running
                 for i in 0..<session.chatItems.count {
@@ -260,8 +282,9 @@ actor SessionStore {
         case "PreToolUse":
             if event.tool == "Task", let toolUseId = event.toolUseId {
                 let description = event.toolInput?["description"]?.value as? String
-                session.subagentState.startTask(taskToolId: toolUseId, description: description)
-                Self.logger.debug("Started Task subagent tracking: \(toolUseId.prefix(12), privacy: .public)")
+                let agentType = event.toolInput?["subagent_type"]?.value as? String
+                session.subagentState.startTask(taskToolId: toolUseId, description: description, agentType: agentType)
+                Self.logger.debug("Started Task subagent tracking: \(toolUseId.prefix(12), privacy: .public) type=\(agentType ?? "unknown", privacy: .public)")
             }
 
         case "PostToolUse":
@@ -339,8 +362,12 @@ actor SessionStore {
                 session.phase = newPhase
                 Self.logger.debug("Switched to next pending tool: \(nextPending.id.prefix(12), privacy: .public)")
             }
+            // Keep hasPendingSocket = true since there's another pending
         } else {
-            // No more pending tools - transition to processing
+            // No more pending tools - clear socket state and transition to processing
+            session.hasPendingSocket = false
+            session.pendingSocketToolName = nil
+            session.pendingSocketToolId = nil
             if case .waitingForApproval(let ctx) = session.phase, ctx.toolUseId == toolUseId {
                 if session.phase.canTransition(to: .processing) {
                     session.phase = .processing
@@ -441,8 +468,12 @@ actor SessionStore {
                 session.phase = newPhase
                 Self.logger.debug("Switched to next pending tool after denial: \(nextPending.id.prefix(12), privacy: .public)")
             }
+            // Keep hasPendingSocket = true since there's another pending
         } else {
-            // No more pending tools - transition to processing (Claude will handle denial)
+            // No more pending tools - clear socket state and transition to processing
+            session.hasPendingSocket = false
+            session.pendingSocketToolName = nil
+            session.pendingSocketToolId = nil
             if case .waitingForApproval(let ctx) = session.phase, ctx.toolUseId == toolUseId {
                 if session.phase.canTransition(to: .processing) {
                     session.phase = .processing
@@ -477,8 +508,12 @@ actor SessionStore {
                 session.phase = newPhase
                 Self.logger.debug("Switched to next pending tool after socket failure: \(nextPending.id.prefix(12), privacy: .public)")
             }
+            // Keep hasPendingSocket = true since there's another pending
         } else {
-            // No more pending tools - clear permission state
+            // No more pending tools - clear socket state and permission state
+            session.hasPendingSocket = false
+            session.pendingSocketToolName = nil
+            session.pendingSocketToolId = nil
             if case .waitingForApproval(let ctx) = session.phase, ctx.toolUseId == toolUseId {
                 session.phase = .idle
             } else if case .waitingForApproval = session.phase {
@@ -496,11 +531,33 @@ actor SessionStore {
         guard var session = sessions[payload.sessionId] else { return }
 
         // Update conversationInfo from JSONL (summary, lastMessage, etc.)
-        let conversationInfo = await ConversationParser.shared.parse(
+        var conversationInfo = await ConversationParser.shared.parse(
             sessionId: payload.sessionId,
             cwd: session.cwd
         )
+
+        // Override thinking state using allMessages (more reliable than parseContent's logic)
+        // This matches how the chat interface detects thinking
+        let (isThinking, thinkingText) = Self.deriveThinkingState(from: payload.allMessages)
+        conversationInfo = ConversationInfo(
+            summary: conversationInfo.summary,
+            lastMessage: conversationInfo.lastMessage,
+            lastMessageRole: conversationInfo.lastMessageRole,
+            lastToolName: conversationInfo.lastToolName,
+            firstUserMessage: conversationInfo.firstUserMessage,
+            lastUserMessageDate: conversationInfo.lastUserMessageDate,
+            turnStartTime: conversationInfo.turnStartTime,
+            turnInputTokens: conversationInfo.turnInputTokens,
+            turnOutputTokens: conversationInfo.turnOutputTokens,
+            turnCacheReadTokens: conversationInfo.turnCacheReadTokens,
+            isThinking: isThinking,
+            lastThinkingText: thinkingText
+        )
+
         session.conversationInfo = conversationInfo
+
+        // Update current todo activeForm from ~/.claude/todos/
+        session.currentTodoActiveForm = TodoFileParser.parseActiveForm(sessionId: payload.sessionId)
 
         // Handle /clear reconciliation - remove items that no longer exist in parser state
         if session.needsClearReconciliation {
@@ -621,6 +678,28 @@ actor SessionStore {
         }
 
         session.toolTracker.lastSyncTime = Date()
+
+        // Detect turn completion: assistant has responded with text (not tool), not thinking, no tools in progress
+        // Key: lastMessageRole must be "assistant" - meaning Claude outputted text, not just a tool call
+        let turnAppearsDone = session.conversationInfo.lastMessageRole == "assistant" &&
+                              !session.isThinking &&
+                              session.currentToolInProgress == nil &&
+                              !session.hasActiveSubagent
+
+        // If we're still in processing but turn appears done, transition to waitingForInput
+        // This handles cases where Claude Code doesn't send an explicit waiting_for_input status
+        if session.phase == .processing && turnAppearsDone {
+            if session.phase.canTransition(to: .waitingForInput) {
+                session.phase = .waitingForInput
+                Self.logger.debug("Detected turn completion from JSONL, transitioning to waitingForInput")
+            }
+        }
+
+        // Set turnEndTime when truly idle (waitingForInput AND turn appears done)
+        let isTrulyIdle = session.phase == .waitingForInput && turnAppearsDone
+        if isTrulyIdle && session.turnEndTime == nil && session.conversationInfo.turnStartTime != nil {
+            session.turnEndTime = Date()
+        }
 
         await populateSubagentToolsFromAgentFiles(
             session: &session,
@@ -846,8 +925,16 @@ actor SessionStore {
     // MARK: - Session End Processing
 
     private func processSessionEnd(sessionId: String) async {
+        // Get cwd before removing session (needed for parser cleanup)
+        let cwd = sessions[sessionId]?.cwd
+
         sessions.removeValue(forKey: sessionId)
         cancelPendingSync(sessionId: sessionId)
+
+        // Clean up ConversationParser state to prevent token leakage
+        if let cwd = cwd {
+            await ConversationParser.shared.clearSession(sessionId: sessionId, cwd: cwd)
+        }
     }
 
     // MARK: - History Loading
@@ -891,6 +978,9 @@ actor SessionStore {
 
         // Update conversationInfo (summary, lastMessage, etc.)
         session.conversationInfo = conversationInfo
+
+        // Update current todo activeForm from ~/.claude/todos/
+        session.currentTodoActiveForm = TodoFileParser.parseActiveForm(sessionId: sessionId)
 
         // Convert messages to chat items
         let existingIds = Set(session.chatItems.map { $0.id })
@@ -949,6 +1039,7 @@ actor SessionStore {
                 sessionId: sessionId,
                 cwd: cwd,
                 messages: result.newMessages,
+                allMessages: result.allMessages,
                 isIncremental: !result.clearDetected,
                 completedToolIds: result.completedToolIds,
                 toolResults: result.toolResults,
@@ -962,6 +1053,28 @@ actor SessionStore {
     private func cancelPendingSync(sessionId: String) {
         pendingSyncs[sessionId]?.cancel()
         pendingSyncs.removeValue(forKey: sessionId)
+    }
+
+    // MARK: - Thinking State Detection
+
+    /// Derive thinking state from parsed messages (same logic as chat interface)
+    /// Returns (isThinking, lastThinkingText)
+    private static func deriveThinkingState(from messages: [ChatMessage]) -> (Bool, String?) {
+        // Find the most recent assistant message
+        guard let lastAssistantMessage = messages.last(where: { $0.role == .assistant }) else {
+            return (false, nil)
+        }
+
+        // Check if the last content block is thinking
+        guard let lastBlock = lastAssistantMessage.content.last else {
+            return (false, nil)
+        }
+
+        if case .thinking(let text) = lastBlock {
+            return (true, text)
+        }
+
+        return (false, nil)
     }
 
     // MARK: - State Publishing

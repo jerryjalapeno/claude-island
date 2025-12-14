@@ -128,11 +128,15 @@ struct InstanceRow: View {
     @State private var spinnerPhase = 0
     @State private var isFocusAvailable = false
     @State private var swipeOffset: CGFloat = 0
+    @State private var swipeYOffset: CGFloat = 0
+    @State private var swipeScale: CGFloat = 1.0
     @State private var isDragging = false
+    @State private var secondsTick: Int = 0  // Force refresh for elapsed time
 
     private let claudeOrange = Color(red: 0.85, green: 0.47, blue: 0.34)
     private let spinnerSymbols = ["·", "✢", "✳", "∗", "✻", "✽"]
     private let spinnerTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
+    private let secondsTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     // Branch color palette - 12 perceptually-spaced colors for dark backgrounds
     private let branchColors: [Color] = [
@@ -159,9 +163,41 @@ struct InstanceRow: View {
     private let actionWidth: CGFloat = 60
     private let swipeThreshold: CGFloat = 50
 
+    // Fun gerund words for status display (inspired by Claude Code's whimsical loading messages)
+    private let funGerunds = [
+        "Spelunking", "Percolating", "Fermenting", "Conjuring", "Manifesting",
+        "Synthesizing", "Orchestrating", "Crystallizing", "Brewing", "Weaving",
+        "Cultivating", "Composing", "Sculpting", "Kindling", "Flourishing",
+        "Blossoming", "Illuminating", "Harmonizing", "Radiating", "Cascading",
+        "Resonating", "Emanating", "Unfurling", "Galvanizing", "Catalyzing",
+        "Transmuting", "Distilling", "Incubating", "Germinating", "Pollinating",
+        "Simmering", "Steeping", "Marinating", "Infusing", "Decanting",
+        "Aerating", "Effervescing", "Bubbling", "Fizzing", "Permeating",
+        "Diffusing", "Osmosing", "Coalescing", "Converging", "Amalgamating",
+        "Fusing", "Melding", "Intertwining", "Entwining", "Braiding",
+        "Knitting", "Crocheting", "Embroidering", "Quilting", "Stitching",
+        "Forging", "Tempering", "Annealing", "Smelting", "Alloying",
+        "Chiseling", "Carving", "Etching", "Engraving", "Embossing",
+        "Glazing", "Burnishing", "Polishing", "Buffing", "Honing",
+        "Whittling", "Shaping", "Molding", "Forming", "Fashioning",
+        "Crafting", "Assembling", "Constructing", "Architecting", "Engineering",
+        "Devising", "Inventing", "Innovating", "Pioneering", "Trailblazing",
+        "Venturing", "Embarking", "Voyaging", "Navigating", "Charting",
+        "Mapping", "Surveying", "Scouting", "Reconnoitering", "Investigating",
+        "Sleuthing", "Deciphering", "Decoding", "Unraveling", "Untangling"
+    ]
+
+    /// Get a deterministic fun gerund based on session ID (stable per session)
+    private func funGerund(for sessionId: String) -> String {
+        let hash = abs(sessionId.hashValue)
+        return funGerunds[hash % funGerunds.count]
+    }
+
     /// Whether we're showing the approval UI
+    /// Uses hasPendingSocket as the source of truth (not phase) because the socket
+    /// being open means there's a real pending request that needs a response
     private var isWaitingForApproval: Bool {
-        session.phase.isWaitingForApproval
+        session.hasPendingSocket
     }
 
     /// Whether the pending tool requires interactive input (not just approve/deny)
@@ -191,38 +227,29 @@ struct InstanceRow: View {
         ZStack {
             // Background action buttons revealed on swipe
             HStack(spacing: 0) {
-                // Left action (swipe right to reveal): Chat
+                // Left action (swipe right to reveal): Claude logo
                 // Only show when swiping right
                 if swipeOffset > 0 {
-                    SwipeActionButton(
-                        icon: "bubble.left.fill",
-                        color: Color.blue,
-                        revealProgress: chatRevealProgress,
-                        isPastThreshold: swipeOffset > swipeThreshold,
-                        isLeading: true
-                    )
+                    HStack {
+                        Spacer()
+                        Image("ClaudeLogo")
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 32, height: 32)
+                            .opacity(chatRevealProgress)
+                            .scaleEffect(swipeOffset > swipeThreshold ? 1.1 : 1.0)
+                        Spacer()
+                    }
                     .frame(width: max(swipeOffset, 0))
                 }
 
                 Spacer()
-
-                // Right action (swipe left to reveal): Archive
-                // Only show when swiping left
-                if swipeOffset < 0 {
-                    SwipeActionButton(
-                        icon: "archivebox.fill",
-                        color: canArchive ? Color.red : Color.gray.opacity(0.5),
-                        revealProgress: archiveRevealProgress,
-                        isPastThreshold: swipeOffset < -swipeThreshold,
-                        isLeading: false
-                    )
-                    .frame(width: max(-swipeOffset, 0))
-                }
             }
 
             // Main content that slides
             mainContent
-                .offset(x: swipeOffset)
+                .scaleEffect(swipeScale)
+                .offset(x: swipeOffset, y: swipeYOffset)
                 .gesture(
                     DragGesture(minimumDistance: 10)
                         .onChanged { value in
@@ -232,14 +259,9 @@ struct InstanceRow: View {
                             if translation > 0 {
                                 // Swiping right (reveal chat)
                                 swipeOffset = min(translation, actionWidth + 20)
-                            } else {
-                                // Swiping left (reveal archive)
-                                if canArchive {
-                                    swipeOffset = max(translation, -(actionWidth + 20))
-                                } else {
-                                    // Add more resistance if can't archive
-                                    swipeOffset = max(translation * 0.3, -30)
-                                }
+                            } else if canArchive {
+                                // Swiping left (archive) - allow free movement
+                                swipeOffset = translation
                             }
                         }
                         .onEnded { value in
@@ -253,15 +275,21 @@ struct InstanceRow: View {
                                 }
                                 onChat()
                             } else if translation < -swipeThreshold && canArchive {
-                                // Swiped left past threshold - archive
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    swipeOffset = 0
+                                // Swiped left past threshold - vanish into top-left
+                                withAnimation(.easeIn(duration: 0.12)) {
+                                    swipeOffset = -300
+                                    swipeYOffset = -40
+                                    swipeScale = 0.01
                                 }
-                                onArchive()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                                    onArchive()
+                                }
                             } else {
                                 // Didn't pass threshold - snap back
                                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                                     swipeOffset = 0
+                                    swipeYOffset = 0
+                                    swipeScale = 1.0
                                 }
                             }
                         }
@@ -276,51 +304,54 @@ struct InstanceRow: View {
     }
 
     private var mainContent: some View {
-        HStack(alignment: .center, spacing: 10) {
-            // State indicator on left
-            stateIndicator
-                .frame(width: 14)
+        // Text content with state indicator in status line
+        VStack(alignment: .leading, spacing: 2) {
+            // Row 1: project/branch + title
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                // Project name (plain text, no pill) - matches compact blue
+                Text(session.projectName)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(TerminalColors.compact)
 
-            // Text content
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
-                    // Project pill (neutral)
-                    Text(session.projectName)
+                // Branch pill (hash-based color) - skip main/master as they're implied
+                if let branch = session.gitBranch, branch != "main" && branch != "master" {
+                    let color = branchColor(for: branch)
+                    Text(branch)
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.7))
+                        .foregroundColor(color)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.white.opacity(0.1))
+                        .background(color.opacity(0.2))
                         .cornerRadius(4)
-
-                    // Branch pill (hash-based color) - skip main/master as they're implied
-                    if let branch = session.gitBranch, branch != "main" && branch != "master" {
-                        let color = branchColor(for: branch)
-                        Text(branch)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(color)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(color.opacity(0.2))
-                            .cornerRadius(4)
-                    }
-
-                    // Summary/detail as main text
-                    if let detail = session.titleDetail {
-                        Text(detail)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                    }
                 }
 
-                // Show tool call when waiting for approval, otherwise last activity
+                // Summary/detail as main text
+                if let detail = session.titleDetail {
+                    Text(detail)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 20)  // Align with status text (14pt indicator + 6pt spacing)
+            .padding(.trailing, 20)  // Match left padding for symmetry
+
+            // Row 2: State indicator + activity status
+            HStack(alignment: .center, spacing: 6) {
+                stateIndicator
+                    .frame(width: 14)
+
+                // Show activity status with priority: approval > compacting > subagent > tool in progress > last message
                 if isWaitingForApproval, let toolName = session.pendingToolName {
-                    // Show tool name in amber + input on same line
+                    // 1. Waiting for approval - amber shimmer
                     HStack(spacing: 4) {
-                        Text(MCPToolFormatter.formatToolName(toolName))
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(TerminalColors.amber.opacity(0.9))
+                        ShimmerText(
+                            text: MCPToolFormatter.formatToolName(toolName),
+                            font: .system(size: 11, weight: .medium),
+                            color: TerminalColors.amber
+                        )
                         if isInteractiveTool {
                             Text("Needs your input")
                                 .font(.system(size: 11))
@@ -333,20 +364,99 @@ struct InstanceRow: View {
                                 .lineLimit(1)
                         }
                     }
+                } else if session.phase == .compacting {
+                    // 1.5. Compacting - blue shimmer
+                    ShimmerText(
+                        text: "Compacting conversation...",
+                        font: .system(size: 11, weight: .medium),
+                        color: TerminalColors.compact
+                    )
+                } else if session.hasActiveSubagent {
+                    // 2. Active subagent - show agent type + description/tool with shimmer
+                    let agentLabel = session.activeSubagentType ?? "Agent"
+                    if let desc = session.activeSubagentDescription {
+                        if let subTool = session.subagentCurrentTool {
+                            ShimmerText(
+                                text: "\(agentLabel): \(desc) · \(MCPToolFormatter.formatToolName(subTool.name))",
+                                font: .system(size: 11, weight: .medium)
+                            )
+                        } else {
+                            ShimmerText(
+                                text: "\(agentLabel): \(desc)",
+                                font: .system(size: 11, weight: .medium)
+                            )
+                        }
+                    } else if let subTool = session.subagentCurrentTool {
+                        ShimmerText(
+                            text: "\(agentLabel): \(MCPToolFormatter.formatToolName(subTool.name))",
+                            font: .system(size: 11, weight: .medium)
+                        )
+                    } else {
+                        ShimmerText(
+                            text: "\(agentLabel) running...",
+                            font: .system(size: 11, weight: .medium)
+                        )
+                    }
+                } else if session.isThinking {
+                    // 3. Currently thinking - show actual thinking text if available
+                    if let thinkingText = session.lastThinkingText {
+                        // Truncate and clean thinking text for single line display
+                        let cleaned = thinkingText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "\n", with: " ")
+                        let truncated = cleaned.count > 60 ? String(cleaned.prefix(57)) + "..." : cleaned
+                        ShimmerText(text: truncated, font: .system(size: 11, weight: .medium))
+                    } else {
+                        ShimmerText(text: "Thinking...", font: .system(size: 11, weight: .medium))
+                    }
+                } else if let todoActiveForm = session.currentTodoActiveForm {
+                    // 4. Show current todo task from status line (e.g., "Adding shimmer effect")
+                    ShimmerText(
+                        text: "\(todoActiveForm)...",
+                        font: .system(size: 11, weight: .medium)
+                    )
+                } else if let tool = session.currentToolInProgress {
+                    // 5. Tool currently running - show with shimmer + details
+                    let toolDisplay = toolDisplayText(tool)
+                    ShimmerText(
+                        text: toolDisplay,
+                        font: .system(size: 11, weight: .medium)
+                    )
+                } else if session.phase == .processing, session.lastMessageRole == "assistant", let msg = session.lastMessage {
+                    // 6. During processing, show assistant text output with shimmer
+                    ShimmerText(
+                        text: msg,
+                        font: .system(size: 11, weight: .medium)
+                    )
+                } else if session.phase == .processing, session.lastMessageRole == "tool", let toolName = session.lastToolName {
+                    // 7. During processing, show tool call with shimmer
+                    if let input = session.lastMessage {
+                        ShimmerText(
+                            text: "\(MCPToolFormatter.formatToolName(toolName)): \(input)",
+                            font: .system(size: 11, weight: .medium)
+                        )
+                    } else {
+                        ShimmerText(
+                            text: MCPToolFormatter.formatToolName(toolName),
+                            font: .system(size: 11, weight: .medium)
+                        )
+                    }
                 } else if let role = session.lastMessageRole {
+                    // 8. Fall back to last message (static - not processing)
                     switch role {
                     case "tool":
-                        // Tool call - show tool name + input
+                        // Tool call - shimmer tool name + static input
                         HStack(spacing: 4) {
                             if let toolName = session.lastToolName {
-                                Text(MCPToolFormatter.formatToolName(toolName))
-                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.5))
+                                ShimmerText(
+                                    text: MCPToolFormatter.formatToolName(toolName),
+                                    font: .system(size: 11, weight: .medium),
+                                    color: claudeOrange
+                                )
                             }
                             if let input = session.lastMessage {
                                 Text(input)
                                     .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.4))
+                                    .foregroundColor(.white.opacity(0.5))
                                     .lineLimit(1)
                             }
                         }
@@ -378,28 +488,59 @@ struct InstanceRow: View {
                         .foregroundColor(.white.opacity(0.4))
                         .lineLimit(1)
                 }
+
+                Spacer(minLength: 0)
+
+                // Only show approval buttons when needed
+                if isWaitingForApproval && isInteractiveTool {
+                    TerminalButton(
+                        isEnabled: true,
+                        onTap: { onFocus() }
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                } else if isWaitingForApproval {
+                    InlineApprovalButtons(
+                        onApprove: onApprove,
+                        onReject: onReject
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
             }
+            .padding(.trailing, 20)  // Match Row 1 trailing padding for symmetry
 
-            Spacer(minLength: 0)
+            // Row 3: Turn stats (time elapsed + tokens) - show when processing or just completed
+            if session.turnElapsedSeconds != nil || session.turnTotalTokens != nil {
+                HStack(spacing: 0) {
+                    // Time elapsed
+                    if let elapsed = session.turnElapsedSeconds, elapsed >= 1 {
+                        Text(formatElapsedTime(elapsed))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.3))
+                            .id(secondsTick)  // Force redraw when tick changes
+                            .onReceive(secondsTimer) { _ in
+                                if session.phase == .processing || session.phase == .compacting {
+                                    secondsTick += 1
+                                }
+                            }
+                    }
 
-            // Only show approval buttons when needed
-            if isWaitingForApproval && isInteractiveTool {
-                TerminalButton(
-                    isEnabled: true,
-                    onTap: { onFocus() }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-            } else if isWaitingForApproval {
-                InlineApprovalButtons(
-                    onChat: onChat,
-                    onApprove: onApprove,
-                    onReject: onReject
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    // Separator
+                    if session.turnElapsedSeconds != nil && session.turnTotalTokens != nil {
+                        Text(" · ")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.3))
+                    }
+
+                    // Animated token counter
+                    if let tokens = session.turnTotalTokens, tokens > 0 {
+                        AnimatedTokenCounter(value: tokens)
+                    }
+                }
+                .padding(.leading, 20)  // Indent to align with status text
+                .padding(.trailing, 20)  // Match other rows for symmetry
             }
         }
-        .padding(.leading, 8)
-        .padding(.trailing, 14)
+        .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 12)
@@ -412,13 +553,56 @@ struct InstanceRow: View {
         }
     }
 
+    /// Format elapsed time for display
+    private func formatElapsedTime(_ elapsed: TimeInterval) -> String {
+        let secs = Int(elapsed)
+        if secs < 60 {
+            return "\(secs)s"
+        } else {
+            let mins = secs / 60
+            let remainingSecs = secs % 60
+            return "\(mins)m \(remainingSecs)s"
+        }
+    }
+
+    /// Format tool display text - uses lastMessage for input details since ToolInProgress doesn't store input
+    private func toolDisplayText(_ tool: ToolInProgress) -> String {
+        let name = MCPToolFormatter.formatToolName(tool.name)
+        // Use lastMessage for input details when tool matches
+        if session.lastToolName == tool.name, let input = session.lastMessage, !input.isEmpty {
+            // Remove newlines and collapse whitespace for single-line display
+            let singleLine = input.replacingOccurrences(of: "\n", with: " ")
+                                  .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            switch tool.name {
+            case "Bash":
+                let truncated = singleLine.count > 35 ? String(singleLine.prefix(32)) + "..." : singleLine
+                return "Bash(\(truncated))"
+            default:
+                let truncated = singleLine.count > 50 ? String(singleLine.prefix(47)) + "..." : singleLine
+                return "\(name): \(truncated)"
+            }
+        }
+        // For Bash with no command details, show a fun gerund instead of boring "Bash..."
+        if tool.name == "Bash" {
+            return "\(funGerund(for: session.sessionId))..."
+        }
+        return "\(name)..."
+    }
+
     @ViewBuilder
     private var stateIndicator: some View {
         switch session.phase {
-        case .processing, .compacting:
+        case .processing:
             Text(spinnerSymbols[spinnerPhase % spinnerSymbols.count])
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(claudeOrange)
+                .onReceive(spinnerTimer) { _ in
+                    spinnerPhase = (spinnerPhase + 1) % spinnerSymbols.count
+                }
+        case .compacting:
+            Text(spinnerSymbols[spinnerPhase % spinnerSymbols.count])
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(TerminalColors.compact)
                 .onReceive(spinnerTimer) { _ in
                     spinnerPhase = (spinnerPhase + 1) % spinnerSymbols.count
                 }
@@ -430,9 +614,21 @@ struct InstanceRow: View {
                     spinnerPhase = (spinnerPhase + 1) % spinnerSymbols.count
                 }
         case .waitingForInput:
-            Circle()
-                .fill(TerminalColors.green)
-                .frame(width: 6, height: 6)
+            // Only show green dot if turn has truly ended (turnEndTime is set)
+            // This matches the timer stop logic in SessionStore.processFileUpdate
+            if session.turnEndTime != nil {
+                Circle()
+                    .fill(TerminalColors.green)
+                    .frame(width: 6, height: 6)
+            } else {
+                // Still processing - show spinner
+                Text(spinnerSymbols[spinnerPhase % spinnerSymbols.count])
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(claudeOrange)
+                    .onReceive(spinnerTimer) { _ in
+                        spinnerPhase = (spinnerPhase + 1) % spinnerSymbols.count
+                    }
+            }
         case .idle, .ended:
             Circle()
                 .fill(Color.white.opacity(0.2))
@@ -476,23 +672,14 @@ struct SwipeActionButton: View {
 
 /// Compact inline approval buttons with staggered animation
 struct InlineApprovalButtons: View {
-    let onChat: () -> Void
     let onApprove: () -> Void
     let onReject: () -> Void
 
-    @State private var showChatButton = false
     @State private var showDenyButton = false
     @State private var showAllowButton = false
 
     var body: some View {
         HStack(spacing: 6) {
-            // Chat button
-            IconButton(icon: "bubble.left") {
-                onChat()
-            }
-            .opacity(showChatButton ? 1 : 0)
-            .scaleEffect(showChatButton ? 1 : 0.8)
-
             Button {
                 onReject()
             } label: {
@@ -525,12 +712,9 @@ struct InlineApprovalButtons: View {
         }
         .onAppear {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.0)) {
-                showChatButton = true
-            }
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.05)) {
                 showDenyButton = true
             }
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.1)) {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.7).delay(0.05)) {
                 showAllowButton = true
             }
         }

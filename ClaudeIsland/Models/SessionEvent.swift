@@ -83,6 +83,8 @@ struct FileUpdatePayload: Sendable {
     let cwd: String
     /// Messages to process - either only new messages (if isIncremental) or all messages
     let messages: [ChatMessage]
+    /// All messages in the session (for deriving current state like thinking)
+    let allMessages: [ChatMessage]
     /// When true, messages contains only NEW messages since last update
     /// When false, messages contains ALL messages (used for initial load or after /clear)
     let isIncremental: Bool

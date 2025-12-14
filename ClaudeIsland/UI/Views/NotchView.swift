@@ -35,8 +35,9 @@ struct NotchView: View {
     }
 
     /// Whether any Claude session has a pending permission request
+    /// Uses hasPendingSocket as the source of truth (not phase)
     private var hasPendingPermission: Bool {
-        sessionMonitor.instances.contains { $0.phase.isWaitingForApproval }
+        sessionMonitor.instances.contains { $0.hasPendingSocket }
     }
 
     /// Whether any Claude session is waiting for user input (done/ready state) within the display window
@@ -251,14 +252,8 @@ struct NotchView: View {
                 HStack(spacing: 4) {
                     ClaudeCrabIcon(size: 14, animateLegs: isProcessing)
                         .matchedGeometryEffect(id: "crab", in: activityNamespace, isSource: showClosedActivity)
-
-                    // Permission indicator only (amber) - waiting for input shows checkmark on right
-                    if hasPendingPermission {
-                        PermissionIndicatorIcon(size: 14, color: Color(red: 0.85, green: 0.47, blue: 0.34))
-                            .matchedGeometryEffect(id: "status-indicator", in: activityNamespace, isSource: showClosedActivity)
-                    }
                 }
-                .frame(width: viewModel.status == .opened ? nil : sideWidth + (hasPendingPermission ? 18 : 0))
+                .frame(width: viewModel.status == .opened ? nil : sideWidth)
                 .padding(.leading, viewModel.status == .opened ? 8 : 0)
             }
 
@@ -278,17 +273,23 @@ struct NotchView: View {
                     .frame(width: closedNotchSize.width - cornerRadiusInsets.closed.top + (isBouncing ? 16 : 0))
             }
 
-            // Right side - spinner when processing/pending, checkmark when waiting for input
-            if showClosedActivity {
-                if isProcessing || hasPendingPermission {
+            // Right side - permission indicator when pending, spinner when processing, checkmark when waiting
+            // Hide when island is opened
+            if showClosedActivity && viewModel.status != .opened {
+                if hasPendingPermission {
+                    // Permission indicator (question mark) on right side
+                    PermissionIndicatorIcon(size: 14, color: TerminalColors.amber)
+                        .matchedGeometryEffect(id: "spinner", in: activityNamespace, isSource: showClosedActivity)
+                        .frame(width: sideWidth)
+                } else if isProcessing {
                     ProcessingSpinner()
                         .matchedGeometryEffect(id: "spinner", in: activityNamespace, isSource: showClosedActivity)
-                        .frame(width: viewModel.status == .opened ? 20 : sideWidth)
+                        .frame(width: sideWidth)
                 } else if hasWaitingForInput {
                     // Checkmark for waiting-for-input on the right side
                     ReadyForInputIndicatorIcon(size: 14, color: TerminalColors.green)
                         .matchedGeometryEffect(id: "spinner", in: activityNamespace, isSource: showClosedActivity)
-                        .frame(width: viewModel.status == .opened ? 20 : sideWidth)
+                        .frame(width: sideWidth)
                 }
             }
         }

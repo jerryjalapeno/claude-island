@@ -54,6 +54,7 @@ class ChatHistoryManager: ObservableObject {
             sessionId: sessionId,
             cwd: cwd,
             messages: messages,
+            allMessages: messages,  // Full sync - messages IS all messages
             isIncremental: false,  // Full sync
             completedToolIds: completedTools,
             toolResults: toolResults,
