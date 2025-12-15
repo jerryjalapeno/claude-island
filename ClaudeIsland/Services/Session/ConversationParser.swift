@@ -26,6 +26,9 @@ struct ConversationInfo: Equatable {
     // Thinking state
     let isThinking: Bool  // Whether the most recent activity was thinking
     let lastThinkingText: String?  // The actual thinking text (for status line display)
+
+    // Text output (separate from tool info)
+    let lastTextOutput: String?  // Most recent text block from assistant (for status line)
 }
 
 // MARK: - Todo File Parser
@@ -130,7 +133,7 @@ actor ConversationParser {
         guard fileManager.fileExists(atPath: sessionFile),
               let attrs = try? fileManager.attributesOfItem(atPath: sessionFile),
               let modDate = attrs[.modificationDate] as? Date else {
-            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil, turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil, isThinking: false, lastThinkingText: nil)
+            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil, turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil, isThinking: false, lastThinkingText: nil, lastTextOutput: nil)
         }
 
         if let cached = cache[sessionFile], cached.modificationDate == modDate {
@@ -139,7 +142,7 @@ actor ConversationParser {
 
         guard let data = fileManager.contents(atPath: sessionFile),
               let content = String(data: data, encoding: .utf8) else {
-            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil, turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil, isThinking: false, lastThinkingText: nil)
+            return ConversationInfo(summary: nil, lastMessage: nil, lastMessageRole: nil, lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil, turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil, isThinking: false, lastThinkingText: nil, lastTextOutput: nil)
         }
 
         let info = parseContent(content)
@@ -166,6 +169,7 @@ actor ConversationParser {
         var turnCacheReadTokens: Int = 0
         var isThinking: Bool = false  // Track if most recent activity is thinking
         var lastThinkingText: String?  // The actual thinking text
+        var lastTextOutput: String?  // Most recent text block from assistant
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -308,7 +312,21 @@ actor ConversationParser {
                                 }
                             }
 
-                            // Now find text/tool content for display (reverse to get most recent)
+                            // Find text and tool content separately
+                            // First pass: find most recent text output (for status line)
+                            if lastTextOutput == nil {
+                                for block in contentArray.reversed() {
+                                    if let blockType = block["type"] as? String,
+                                       blockType == "text",
+                                       let text = block["text"] as? String,
+                                       !text.hasPrefix("[Request interrupted by user") {
+                                        lastTextOutput = text
+                                        break
+                                    }
+                                }
+                            }
+
+                            // Second pass: find most recent activity (tool or text) for lastMessage
                             for block in contentArray.reversed() {
                                 let blockType = block["type"] as? String
                                 if blockType == "tool_use" {
@@ -354,7 +372,8 @@ actor ConversationParser {
             turnOutputTokens: turnOutputTokens > 0 ? turnOutputTokens : nil,
             turnCacheReadTokens: turnCacheReadTokens > 0 ? turnCacheReadTokens : nil,
             isThinking: isThinking,
-            lastThinkingText: lastThinkingText
+            lastThinkingText: lastThinkingText,
+            lastTextOutput: Self.truncateMessage(lastTextOutput, maxLength: 80)
         )
     }
 

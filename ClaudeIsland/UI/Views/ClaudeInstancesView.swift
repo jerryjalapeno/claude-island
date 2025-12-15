@@ -211,6 +211,12 @@ struct InstanceRow: View {
         session.phase == .idle || session.phase == .waitingForInput
     }
 
+    /// Whether text output was recent enough to display (within 2 seconds)
+    private var isTextOutputRecent: Bool {
+        guard let outputTime = session.lastTextOutputTime else { return false }
+        return Date().timeIntervalSince(outputTime) < 2.0
+    }
+
     /// Progress for chat button reveal (0 to 1)
     private var chatRevealProgress: CGFloat {
         guard swipeOffset > 0 else { return 0 }
@@ -225,31 +231,17 @@ struct InstanceRow: View {
 
     var body: some View {
         ZStack {
-            // Background action buttons revealed on swipe
-            HStack(spacing: 0) {
-                // Left action (swipe right to reveal): Claude logo
-                // Only show when swiping right
-                if swipeOffset > 0 {
-                    HStack {
-                        Spacer()
-                        Image("ClaudeLogo")
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 32, height: 32)
-                            .opacity(chatRevealProgress)
-                            .scaleEffect(swipeOffset > swipeThreshold ? 1.1 : 1.0)
-                        Spacer()
-                    }
-                    .frame(width: max(swipeOffset, 0))
-                }
-
-                Spacer()
+            // Chat preview that fades in as you swipe right (behind main content)
+            if swipeOffset > 0 {
+                chatPreview
+                    .opacity(chatRevealProgress)
             }
 
-            // Main content that slides
+            // Main content - fades out when swiping right, slides when swiping left
             mainContent
                 .scaleEffect(swipeScale)
-                .offset(x: swipeOffset, y: swipeYOffset)
+                .offset(x: swipeOffset < 0 ? swipeOffset : 0, y: swipeYOffset)  // Only offset when swiping left
+                .opacity(swipeOffset > 0 ? (1.0 - chatRevealProgress * 0.9) : 1.0)  // Fade out when swiping right
                 .gesture(
                     DragGesture(minimumDistance: 10)
                         .onChanged { value in
@@ -257,8 +249,8 @@ struct InstanceRow: View {
                             let translation = value.translation.width
                             // Add resistance at edges
                             if translation > 0 {
-                                // Swiping right (reveal chat)
-                                swipeOffset = min(translation, actionWidth + 20)
+                                // Swiping right (reveal chat) - with resistance
+                                swipeOffset = min(translation * 0.8, actionWidth + 30)
                             } else if canArchive {
                                 // Swiping left (archive) - allow free movement
                                 swipeOffset = translation
@@ -269,11 +261,17 @@ struct InstanceRow: View {
                             let translation = value.translation.width
 
                             if translation > swipeThreshold {
-                                // Swiped right past threshold - open chat
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    swipeOffset = 0
+                                // Swiped right past threshold - complete fade and open chat
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    swipeOffset = actionWidth + 40  // Fade out fully
                                 }
-                                onChat()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                    onChat()
+                                    // Reset after transition
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                        swipeOffset = 0
+                                    }
+                                }
                             } else if translation < -swipeThreshold && canArchive {
                                 // Swiped left past threshold - vanish into top-left
                                 withAnimation(.easeIn(duration: 0.12)) {
@@ -397,49 +395,47 @@ struct InstanceRow: View {
                             font: .system(size: 11, weight: .medium)
                         )
                     }
-                } else if session.isThinking {
-                    // 3. Currently thinking - show actual thinking text if available
-                    if let thinkingText = session.lastThinkingText {
-                        // Truncate and clean thinking text for single line display
-                        let cleaned = thinkingText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            .replacingOccurrences(of: "\n", with: " ")
-                        let truncated = cleaned.count > 60 ? String(cleaned.prefix(57)) + "..." : cleaned
-                        ShimmerText(text: truncated, font: .system(size: 11, weight: .medium))
-                    } else {
-                        ShimmerText(text: "Thinking...", font: .system(size: 11, weight: .medium))
-                    }
-                } else if let todoActiveForm = session.currentTodoActiveForm {
-                    // 4. Show current todo task from status line (e.g., "Adding shimmer effect")
-                    ShimmerText(
-                        text: "\(todoActiveForm)...",
-                        font: .system(size: 11, weight: .medium)
-                    )
                 } else if let tool = session.currentToolInProgress {
-                    // 5. Tool currently running - show with shimmer + details
+                    // 3. Tool currently running - show with shimmer + details
                     let toolDisplay = toolDisplayText(tool)
                     ShimmerText(
                         text: toolDisplay,
                         font: .system(size: 11, weight: .medium)
                     )
-                } else if session.phase == .processing, session.lastMessageRole == "assistant", let msg = session.lastMessage {
-                    // 6. During processing, show assistant text output with shimmer
+                } else if session.isThinking {
+                    // 4. Actively thinking - show thinking text in italics
+                    if let thinkingText = session.lastThinkingText {
+                        let cleaned = thinkingText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "\n", with: " ")
+                        let truncated = cleaned.count > 60 ? String(cleaned.prefix(57)) + "..." : cleaned
+                        ShimmerText(text: truncated, font: .system(size: 11, weight: .medium).italic())
+                    } else {
+                        ShimmerText(text: "Thinking...", font: .system(size: 11, weight: .medium).italic())
+                    }
+                } else if session.phase == .processing, let textOutput = session.lastTextOutput, isTextOutputRecent {
+                    // 5. Recent text output - show for minimum 2 seconds
                     ShimmerText(
-                        text: msg,
+                        text: textOutput,
                         font: .system(size: 11, weight: .medium)
                     )
-                } else if session.phase == .processing, session.lastMessageRole == "tool", let toolName = session.lastToolName {
-                    // 7. During processing, show tool call with shimmer
-                    if let input = session.lastMessage {
-                        ShimmerText(
-                            text: "\(MCPToolFormatter.formatToolName(toolName)): \(input)",
-                            font: .system(size: 11, weight: .medium)
-                        )
-                    } else {
-                        ShimmerText(
-                            text: MCPToolFormatter.formatToolName(toolName),
-                            font: .system(size: 11, weight: .medium)
-                        )
-                    }
+                } else if session.phase == .processing, let thinkingText = session.lastThinkingText {
+                    // 6. Recent thinking (not actively thinking) - show in italics
+                    let cleaned = thinkingText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .replacingOccurrences(of: "\n", with: " ")
+                    let truncated = cleaned.count > 60 ? String(cleaned.prefix(57)) + "..." : cleaned
+                    ShimmerText(text: truncated, font: .system(size: 11, weight: .medium).italic())
+                } else if let todoActiveForm = session.currentTodoActiveForm {
+                    // 7. Show current todo task from status line
+                    ShimmerText(
+                        text: "\(todoActiveForm)...",
+                        font: .system(size: 11, weight: .medium)
+                    )
+                } else if session.phase == .processing {
+                    // 8. Processing but no specific info - show fun transitional word
+                    ShimmerText(
+                        text: "\(funGerund(for: session.sessionId))...",
+                        font: .system(size: 11, weight: .medium)
+                    )
                 } else if let role = session.lastMessageRole {
                     // 8. Fall back to last message (static - not processing)
                     switch role {
@@ -634,6 +630,51 @@ struct InstanceRow: View {
                 .fill(Color.white.opacity(0.2))
                 .frame(width: 6, height: 6)
         }
+    }
+
+    /// Chat preview that fades in when swiping right
+    private var chatPreview: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Header with Claude logo and project name
+            HStack(spacing: 8) {
+                Image("ClaudeLogo")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 20, height: 20)
+
+                Text(session.projectName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+
+                if let branch = session.gitBranch, branch != "main" && branch != "master" {
+                    Text("/ \(branch)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(branchColor(for: branch).opacity(0.8))
+                }
+
+                Spacer()
+
+                // Hint arrow
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(swipeOffset > swipeThreshold ? 0.8 : 0.4))
+            }
+
+            // Title/summary preview
+            if let detail = session.titleDetail {
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.6))
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.white.opacity(0.08))
+        )
     }
 
 }

@@ -539,6 +539,14 @@ actor SessionStore {
         // Override thinking state using allMessages (more reliable than parseContent's logic)
         // This matches how the chat interface detects thinking
         let (isThinking, thinkingText) = Self.deriveThinkingState(from: payload.allMessages)
+
+        // Track if text output changed (for minimum display time)
+        let previousTextOutput = session.conversationInfo.lastTextOutput
+        let newTextOutput = conversationInfo.lastTextOutput
+        if newTextOutput != previousTextOutput && newTextOutput != nil {
+            session.lastTextOutputTime = Date()
+        }
+
         conversationInfo = ConversationInfo(
             summary: conversationInfo.summary,
             lastMessage: conversationInfo.lastMessage,
@@ -551,7 +559,8 @@ actor SessionStore {
             turnOutputTokens: conversationInfo.turnOutputTokens,
             turnCacheReadTokens: conversationInfo.turnCacheReadTokens,
             isThinking: isThinking,
-            lastThinkingText: thinkingText
+            lastThinkingText: thinkingText,
+            lastTextOutput: newTextOutput
         )
 
         session.conversationInfo = conversationInfo
@@ -1060,18 +1069,39 @@ actor SessionStore {
     /// Derive thinking state from parsed messages (same logic as chat interface)
     /// Returns (isThinking, lastThinkingText)
     private static func deriveThinkingState(from messages: [ChatMessage]) -> (Bool, String?) {
-        // Find the most recent assistant message
-        guard let lastAssistantMessage = messages.last(where: { $0.role == .assistant }) else {
-            return (false, nil)
+        // Search through assistant messages in reverse (most recent first)
+        // Thinking blocks may be in earlier assistant messages, not just the last one
+        var mostRecentThinking: String?
+
+        for message in messages.reversed() {
+            guard message.role == .assistant else { continue }
+
+            // Check if this message's last block is thinking (actively thinking)
+            if let lastBlock = message.content.last {
+                if case .thinking(let text) = lastBlock {
+                    return (true, text)
+                }
+            }
+
+            // If we haven't found thinking yet, check all blocks in this message
+            if mostRecentThinking == nil {
+                for block in message.content.reversed() {
+                    if case .thinking(let text) = block {
+                        mostRecentThinking = text
+                        break
+                    }
+                }
+            }
+
+            // Only look at recent messages (within last few assistant messages)
+            // to avoid showing very old thinking
+            if mostRecentThinking != nil {
+                break
+            }
         }
 
-        // Check if the last content block is thinking
-        guard let lastBlock = lastAssistantMessage.content.last else {
-            return (false, nil)
-        }
-
-        if case .thinking(let text) = lastBlock {
-            return (true, text)
+        if let thinking = mostRecentThinking {
+            return (false, thinking)
         }
 
         return (false, nil)

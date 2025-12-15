@@ -77,6 +77,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
     var lastActivity: Date
     var createdAt: Date
     var turnEndTime: Date?  // Set when turn completes (phase -> waitingForInput)
+    var lastTextOutputTime: Date?  // When text output was last captured (for minimum display time)
 
     // MARK: - Identifiable
 
@@ -100,7 +101,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
             summary: nil, lastMessage: nil, lastMessageRole: nil,
             lastToolName: nil, firstUserMessage: nil, lastUserMessageDate: nil,
             turnStartTime: nil, turnInputTokens: nil, turnOutputTokens: nil, turnCacheReadTokens: nil,
-            isThinking: false, lastThinkingText: nil
+            isThinking: false, lastThinkingText: nil, lastTextOutput: nil
         ),
         currentTodoActiveForm: String? = nil,
         needsClearReconciliation: Bool = false,
@@ -109,7 +110,8 @@ struct SessionState: Equatable, Identifiable, Sendable {
         pendingSocketToolId: String? = nil,
         lastActivity: Date = Date(),
         createdAt: Date = Date(),
-        turnEndTime: Date? = nil
+        turnEndTime: Date? = nil,
+        lastTextOutputTime: Date? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
@@ -131,6 +133,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.lastActivity = lastActivity
         self.createdAt = createdAt
         self.turnEndTime = turnEndTime
+        self.lastTextOutputTime = lastTextOutputTime
     }
 
     // MARK: - Derived Properties
@@ -310,6 +313,11 @@ struct SessionState: Equatable, Identifiable, Sendable {
     /// The current thinking text (for status line display)
     var lastThinkingText: String? {
         conversationInfo.lastThinkingText
+    }
+
+    /// Most recent text output from assistant (for status line display)
+    var lastTextOutput: String? {
+        conversationInfo.lastTextOutput
     }
 
     /// Input tokens for current turn
