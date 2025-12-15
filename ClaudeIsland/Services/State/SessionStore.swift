@@ -19,6 +19,24 @@ actor SessionStore {
     /// Logger for session store (nonisolated static for cross-context access)
     nonisolated static let logger = Logger(subsystem: "com.claudeisland", category: "Session")
 
+    /// Debug log to file for troubleshooting status line
+    /// Only logs if /tmp/claude-island-debug-enabled exists (toggle with touch/rm)
+    nonisolated static func debugLog(_ message: String) {
+        // Check if debug logging is enabled via flag file
+        guard FileManager.default.fileExists(atPath: "/tmp/claude-island-debug-enabled") else { return }
+
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        let logPath = "/tmp/claude-island-debug.log"
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile()
+            handle.write(line.data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
+        }
+    }
+
     // MARK: - State
 
     /// All sessions keyed by sessionId
@@ -147,6 +165,7 @@ actor SessionStore {
         let newPhase = event.determinePhase()
 
         if session.phase.canTransition(to: newPhase) {
+            let oldPhase = session.phase
             session.phase = newPhase
 
             // When turn ends (waiting for input), clear todo
@@ -154,9 +173,33 @@ actor SessionStore {
             if case .waitingForInput = newPhase {
                 session.currentTodoActiveForm = nil
             }
-            // When a new turn starts (processing), clear end time
-            if case .processing = newPhase {
+            // When a new turn starts (transitioning TO processing FROM non-processing), clear previous turn's state
+            // Don't clear on processing -> processing (e.g., PreToolUse during a turn)
+            let wasProcessing: Bool
+            if case .processing = oldPhase {
+                wasProcessing = true
+            } else {
+                wasProcessing = false
+            }
+
+            if case .processing = newPhase, !wasProcessing {
                 session.turnEndTime = nil
+                // Clear old thinking/text output so they don't show during new turn
+                session.conversationInfo = ConversationInfo(
+                    summary: session.conversationInfo.summary,
+                    lastMessage: session.conversationInfo.lastMessage,
+                    lastMessageRole: session.conversationInfo.lastMessageRole,
+                    lastToolName: session.conversationInfo.lastToolName,
+                    firstUserMessage: session.conversationInfo.firstUserMessage,
+                    lastUserMessageDate: session.conversationInfo.lastUserMessageDate,
+                    turnStartTime: session.conversationInfo.turnStartTime,
+                    turnInputTokens: nil,  // Reset token counts for new turn
+                    turnOutputTokens: nil,
+                    turnCacheReadTokens: nil,
+                    isThinking: false,
+                    lastThinkingText: nil,  // Clear old thinking
+                    lastTextOutput: nil  // Clear old text output
+                )
             }
         } else {
             Self.logger.debug("Invalid transition: \(String(describing: session.phase), privacy: .public) -> \(String(describing: newPhase), privacy: .public), ignoring")
@@ -176,6 +219,27 @@ actor SessionStore {
 
         if event.event == "Stop" {
             session.subagentState = SubagentState()
+            // Stop is the authoritative signal that turn is done - set turnEndTime immediately
+            // Don't wait for file sync/JSONL parsing which might have stale thinking state
+            if session.turnEndTime == nil && session.conversationInfo.turnStartTime != nil {
+                session.turnEndTime = Date()
+            }
+            // Also clear thinking state since the turn is definitively over
+            session.conversationInfo = ConversationInfo(
+                summary: session.conversationInfo.summary,
+                lastMessage: session.conversationInfo.lastMessage,
+                lastMessageRole: session.conversationInfo.lastMessageRole,
+                lastToolName: session.conversationInfo.lastToolName,
+                firstUserMessage: session.conversationInfo.firstUserMessage,
+                lastUserMessageDate: session.conversationInfo.lastUserMessageDate,
+                turnStartTime: session.conversationInfo.turnStartTime,
+                turnInputTokens: session.conversationInfo.turnInputTokens,
+                turnOutputTokens: session.conversationInfo.turnOutputTokens,
+                turnCacheReadTokens: session.conversationInfo.turnCacheReadTokens,
+                isThinking: false,  // Turn is done, not thinking anymore
+                lastThinkingText: session.conversationInfo.lastThinkingText,
+                lastTextOutput: session.conversationInfo.lastTextOutput
+            )
         }
 
         sessions[sessionId] = session
@@ -203,7 +267,9 @@ actor SessionStore {
         switch event.event {
         case "PreToolUse":
             if let toolUseId = event.toolUseId, let toolName = event.tool {
+                Self.debugLog("TOOL_START: sid=\(event.sessionId.prefix(8)) \(toolName) id=\(toolUseId.prefix(12)) before=\(session.toolTracker.inProgress.count)")
                 session.toolTracker.startTool(id: toolUseId, name: toolName)
+                Self.debugLog("TOOL_START: after=\(session.toolTracker.inProgress.count) ids=[\(session.toolTracker.inProgress.keys.map { String($0.prefix(12)) }.joined(separator: ", "))]")
 
                 // Skip creating top-level placeholder for subagent tools
                 // They'll appear under their parent Task instead
@@ -246,7 +312,9 @@ actor SessionStore {
 
         case "PostToolUse":
             if let toolUseId = event.toolUseId {
+                Self.debugLog("TOOL_END: sid=\(event.sessionId.prefix(8)) id=\(toolUseId.prefix(12)) before=\(session.toolTracker.inProgress.count) ids=[\(session.toolTracker.inProgress.keys.map { String($0.prefix(12)) }.joined(separator: ", "))]")
                 session.toolTracker.completeTool(id: toolUseId, success: true)
+                Self.debugLog("TOOL_END: after=\(session.toolTracker.inProgress.count)")
                 // Only clear pending socket state if this PostToolUse is for the pending tool
                 // Otherwise a different tool's completion would incorrectly clear the socket
                 if session.hasPendingSocket && session.pendingSocketToolId == toolUseId {
@@ -538,14 +606,19 @@ actor SessionStore {
 
         // Override thinking state using allMessages (more reliable than parseContent's logic)
         // This matches how the chat interface detects thinking
-        let (isThinking, thinkingText) = Self.deriveThinkingState(from: payload.allMessages)
+        var (isThinking, thinkingText) = Self.deriveThinkingState(from: payload.allMessages)
 
-        // Track if text output changed (for minimum display time)
-        let previousTextOutput = session.conversationInfo.lastTextOutput
-        let newTextOutput = conversationInfo.lastTextOutput
-        if newTextOutput != previousTextOutput && newTextOutput != nil {
-            session.lastTextOutputTime = Date()
+        // If phase is already waitingForInput (Stop event received), don't override with stale thinking state
+        // The Stop event is the authoritative signal that the turn is done
+        if session.phase == .waitingForInput {
+            isThinking = false
         }
+
+        let newTextOutput = conversationInfo.lastTextOutput
+
+        let toolsInProgress = session.toolTracker.inProgress.values.map { $0.name }.joined(separator: ", ")
+        let toolIds = session.toolTracker.inProgress.keys.map { String($0.prefix(12)) }.joined(separator: ", ")
+        Self.debugLog("FILE_UPDATE: sid=\(payload.sessionId.prefix(8)) phase=\(session.phase) toolsInProgress=[\(toolsInProgress)] toolIds=[\(toolIds)]")
 
         conversationInfo = ConversationInfo(
             summary: conversationInfo.summary,
@@ -688,12 +761,15 @@ actor SessionStore {
 
         session.toolTracker.lastSyncTime = Date()
 
-        // Detect turn completion: assistant has responded with text (not tool), not thinking, no tools in progress
-        // Key: lastMessageRole must be "assistant" - meaning Claude outputted text, not just a tool call
-        let turnAppearsDone = session.conversationInfo.lastMessageRole == "assistant" &&
-                              !session.isThinking &&
-                              session.currentToolInProgress == nil &&
-                              !session.hasActiveSubagent
+        // Detect turn completion: assistant has responded with text, not thinking, no tools in progress
+        // Check either lastMessageRole is "assistant" OR we have recent text output with no active work
+        let noActiveWork = !session.isThinking &&
+                          session.currentToolInProgress == nil &&
+                          !session.hasActiveSubagent &&
+                          session.toolTracker.inProgress.isEmpty
+        // Turn appears done when last activity was assistant text/response AND no active work
+        // Note: Don't use hasTextOutput here - that persists across tool calls within a turn
+        let turnAppearsDone = session.conversationInfo.lastMessageRole == "assistant" && noActiveWork
 
         // If we're still in processing but turn appears done, transition to waitingForInput
         // This handles cases where Claude Code doesn't send an explicit waiting_for_input status
@@ -1066,45 +1142,49 @@ actor SessionStore {
 
     // MARK: - Thinking State Detection
 
-    /// Derive thinking state from parsed messages (same logic as chat interface)
-    /// Returns (isThinking, lastThinkingText)
+    /// Derive thinking state from parsed messages
+    /// Returns (isActivelyThinking, lastThinkingText)
+    /// - isActivelyThinking: true only if the LAST block of the LAST assistant message is thinking
+    /// - lastThinkingText: most recent thinking text from ANY assistant message in the current turn
     private static func deriveThinkingState(from messages: [ChatMessage]) -> (Bool, String?) {
-        // Search through assistant messages in reverse (most recent first)
-        // Thinking blocks may be in earlier assistant messages, not just the last one
-        var mostRecentThinking: String?
+        var lastThinkingText: String?
+        var isActivelyThinking = false
+        var isFirstAssistant = true
 
+        // Check all assistant messages until we hit a user message (current turn)
+        // Each JSONL line is a separate message, so thinking is in its own message
         for message in messages.reversed() {
-            guard message.role == .assistant else { continue }
-
-            // Check if this message's last block is thinking (actively thinking)
-            if let lastBlock = message.content.last {
-                if case .thinking(let text) = lastBlock {
-                    return (true, text)
-                }
+            // Stop at user message (end of current turn)
+            if message.role == .user {
+                break
             }
 
-            // If we haven't found thinking yet, check all blocks in this message
-            if mostRecentThinking == nil {
-                for block in message.content.reversed() {
-                    if case .thinking(let text) = block {
-                        mostRecentThinking = text
-                        break
+            guard message.role == .assistant else { continue }
+
+            // Check all blocks for thinking
+            for block in message.content {
+                if case .thinking(let text) = block {
+                    // Keep the most recent thinking text (first found when going backwards)
+                    if lastThinkingText == nil {
+                        lastThinkingText = text
+                    }
+
+                    // Check if this is the most recent assistant message and thinking is the last block
+                    if isFirstAssistant {
+                        if let lastBlock = message.content.last, case .thinking = lastBlock {
+                            isActivelyThinking = true
+                        }
                     }
                 }
             }
 
-            // Only look at recent messages (within last few assistant messages)
-            // to avoid showing very old thinking
-            if mostRecentThinking != nil {
-                break
+            // Mark that we've processed the first (most recent) assistant message
+            if isFirstAssistant {
+                isFirstAssistant = false
             }
         }
 
-        if let thinking = mostRecentThinking {
-            return (false, thinking)
-        }
-
-        return (false, nil)
+        return (isActivelyThinking, lastThinkingText)
     }
 
     // MARK: - State Publishing

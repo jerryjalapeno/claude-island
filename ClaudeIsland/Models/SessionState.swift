@@ -77,7 +77,6 @@ struct SessionState: Equatable, Identifiable, Sendable {
     var lastActivity: Date
     var createdAt: Date
     var turnEndTime: Date?  // Set when turn completes (phase -> waitingForInput)
-    var lastTextOutputTime: Date?  // When text output was last captured (for minimum display time)
 
     // MARK: - Identifiable
 
@@ -110,8 +109,7 @@ struct SessionState: Equatable, Identifiable, Sendable {
         pendingSocketToolId: String? = nil,
         lastActivity: Date = Date(),
         createdAt: Date = Date(),
-        turnEndTime: Date? = nil,
-        lastTextOutputTime: Date? = nil
+        turnEndTime: Date? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
@@ -133,7 +131,6 @@ struct SessionState: Equatable, Identifiable, Sendable {
         self.lastActivity = lastActivity
         self.createdAt = createdAt
         self.turnEndTime = turnEndTime
-        self.lastTextOutputTime = lastTextOutputTime
     }
 
     // MARK: - Derived Properties

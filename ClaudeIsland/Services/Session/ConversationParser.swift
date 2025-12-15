@@ -270,7 +270,9 @@ actor ConversationParser {
         }
 
         // Now iterate in reverse to find last message and summary (most recent first)
+        // Also look for text/thinking output in ALL assistant messages of current turn
         var foundMostRecentAssistant = false  // Track if we've processed the most recent assistant entry
+        var hitUserMessage = false  // Stop looking for text/thinking at user message (end of turn)
 
         for line in lines.reversed() {
             guard let lineData = line.data(using: .utf8),
@@ -281,52 +283,88 @@ actor ConversationParser {
             let type = json["type"] as? String
             let isMeta = json["isMeta"] as? Bool ?? false
 
-            if lastMessage == nil {
-                if type == "user" || type == "assistant" {
-                    if !isMeta, let message = json["message"] as? [String: Any] {
-                        let isFirstAssistant = !foundMostRecentAssistant && type == "assistant"
-                        if type == "assistant" {
-                            foundMostRecentAssistant = true
+            // Mark when we hit an actual user input message (end of current turn)
+            // Tool results are type "user" but don't end the turn
+            if type == "user" && !isMeta {
+                if let message = json["message"] as? [String: Any] {
+                    // Check if it's real user text input (string content) vs tool_result
+                    if let content = message["content"] as? String {
+                        if !content.hasPrefix("<command-name>") && !content.hasPrefix("<local-command") && !content.hasPrefix("Caveat:") {
+                            hitUserMessage = true
                         }
+                    } else if let contentArray = message["content"] as? [[String: Any]] {
+                        // Array content - check if it contains tool_result
+                        let hasToolResult = contentArray.contains { $0["type"] as? String == "tool_result" }
+                        if !hasToolResult {
+                            hitUserMessage = true
+                        }
+                    }
+                }
+            }
 
-                        if let msgContent = message["content"] as? String {
-                            if !msgContent.hasPrefix("<command-name>") && !msgContent.hasPrefix("<local-command") && !msgContent.hasPrefix("Caveat:") {
+            if type == "user" || type == "assistant" {
+                if !isMeta, let message = json["message"] as? [String: Any] {
+                    let isFirstAssistant = !foundMostRecentAssistant && type == "assistant"
+                    if type == "assistant" {
+                        foundMostRecentAssistant = true
+                    }
+
+                    if let msgContent = message["content"] as? String {
+                        if !msgContent.hasPrefix("<command-name>") && !msgContent.hasPrefix("<local-command") && !msgContent.hasPrefix("Caveat:") {
+                            // Set lastMessage only once (first encountered)
+                            if lastMessage == nil {
                                 lastMessage = msgContent
                                 lastMessageRole = type
-                                if isFirstAssistant {
-                                    isThinking = false
-                                }
                             }
-                        } else if let contentArray = message["content"] as? [[String: Any]] {
-                            // For the most recent assistant message, check if thinking is the LAST block
-                            // This indicates Claude is currently thinking (thinking appears at end during streaming)
+                            // Also set lastTextOutput for simple string content (assistant responses)
+                            if type == "assistant" && lastTextOutput == nil && !hitUserMessage {
+                                lastTextOutput = msgContent
+                            }
                             if isFirstAssistant {
-                                // Check what the last block type is
-                                if let lastBlock = contentArray.last,
-                                   let lastBlockType = lastBlock["type"] as? String {
-                                    isThinking = (lastBlockType == "thinking")
-                                    // Capture the thinking text for status line display
-                                    if isThinking, let thinkingText = lastBlock["thinking"] as? String {
-                                        lastThinkingText = thinkingText
-                                    }
+                                isThinking = false
+                            }
+                        }
+                    } else if let contentArray = message["content"] as? [[String: Any]] {
+                        // For the most recent assistant message, check if thinking is the LAST block
+                        // This indicates Claude is currently thinking (thinking appears at end during streaming)
+                        if isFirstAssistant {
+                            // Check what the last block type is
+                            if let lastBlock = contentArray.last,
+                               let lastBlockType = lastBlock["type"] as? String {
+                                isThinking = (lastBlockType == "thinking")
+                                // Capture the thinking text for status line display
+                                if isThinking, let thinkingText = lastBlock["thinking"] as? String {
+                                    lastThinkingText = thinkingText
                                 }
                             }
+                        }
 
-                            // Find text and tool content separately
-                            // First pass: find most recent text output (for status line)
-                            if lastTextOutput == nil {
-                                for block in contentArray.reversed() {
-                                    if let blockType = block["type"] as? String,
-                                       blockType == "text",
-                                       let text = block["text"] as? String,
-                                       !text.hasPrefix("[Request interrupted by user") {
-                                        lastTextOutput = text
-                                        break
-                                    }
+                        // Find text output from ANY assistant message in current turn
+                        if lastTextOutput == nil && type == "assistant" && !hitUserMessage {
+                            for block in contentArray.reversed() {
+                                if let blockType = block["type"] as? String,
+                                   blockType == "text",
+                                   let text = block["text"] as? String,
+                                   !text.hasPrefix("[Request interrupted by user") {
+                                    lastTextOutput = text
+                                    break
                                 }
                             }
+                        }
 
-                            // Second pass: find most recent activity (tool or text) for lastMessage
+                        // Find thinking text from ANY assistant message in current turn
+                        if lastThinkingText == nil && type == "assistant" && !hitUserMessage {
+                            for block in contentArray {
+                                if let blockType = block["type"] as? String,
+                                   blockType == "thinking",
+                                   let text = block["thinking"] as? String {
+                                    lastThinkingText = text
+                                }
+                            }
+                        }
+
+                        // Find most recent activity (tool or text) for lastMessage - only set once
+                        if lastMessage == nil {
                             for block in contentArray.reversed() {
                                 let blockType = block["type"] as? String
                                 if blockType == "tool_use" {
@@ -354,8 +392,9 @@ actor ConversationParser {
                 summary = summaryText
             }
 
-            // Early exit once we have everything
-            if summary != nil && lastMessage != nil {
+            // Early exit once we have everything we need
+            // Need: summary, lastMessage, and either (text+thinking output OR hit user message)
+            if summary != nil && lastMessage != nil && (hitUserMessage || (lastTextOutput != nil && lastThinkingText != nil)) {
                 break
             }
         }

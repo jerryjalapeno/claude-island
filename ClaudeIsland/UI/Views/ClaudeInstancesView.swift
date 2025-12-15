@@ -163,36 +163,6 @@ struct InstanceRow: View {
     private let actionWidth: CGFloat = 60
     private let swipeThreshold: CGFloat = 50
 
-    // Fun gerund words for status display (inspired by Claude Code's whimsical loading messages)
-    private let funGerunds = [
-        "Spelunking", "Percolating", "Fermenting", "Conjuring", "Manifesting",
-        "Synthesizing", "Orchestrating", "Crystallizing", "Brewing", "Weaving",
-        "Cultivating", "Composing", "Sculpting", "Kindling", "Flourishing",
-        "Blossoming", "Illuminating", "Harmonizing", "Radiating", "Cascading",
-        "Resonating", "Emanating", "Unfurling", "Galvanizing", "Catalyzing",
-        "Transmuting", "Distilling", "Incubating", "Germinating", "Pollinating",
-        "Simmering", "Steeping", "Marinating", "Infusing", "Decanting",
-        "Aerating", "Effervescing", "Bubbling", "Fizzing", "Permeating",
-        "Diffusing", "Osmosing", "Coalescing", "Converging", "Amalgamating",
-        "Fusing", "Melding", "Intertwining", "Entwining", "Braiding",
-        "Knitting", "Crocheting", "Embroidering", "Quilting", "Stitching",
-        "Forging", "Tempering", "Annealing", "Smelting", "Alloying",
-        "Chiseling", "Carving", "Etching", "Engraving", "Embossing",
-        "Glazing", "Burnishing", "Polishing", "Buffing", "Honing",
-        "Whittling", "Shaping", "Molding", "Forming", "Fashioning",
-        "Crafting", "Assembling", "Constructing", "Architecting", "Engineering",
-        "Devising", "Inventing", "Innovating", "Pioneering", "Trailblazing",
-        "Venturing", "Embarking", "Voyaging", "Navigating", "Charting",
-        "Mapping", "Surveying", "Scouting", "Reconnoitering", "Investigating",
-        "Sleuthing", "Deciphering", "Decoding", "Unraveling", "Untangling"
-    ]
-
-    /// Get a deterministic fun gerund based on session ID (stable per session)
-    private func funGerund(for sessionId: String) -> String {
-        let hash = abs(sessionId.hashValue)
-        return funGerunds[hash % funGerunds.count]
-    }
-
     /// Whether we're showing the approval UI
     /// Uses hasPendingSocket as the source of truth (not phase) because the socket
     /// being open means there's a real pending request that needs a response
@@ -211,12 +181,6 @@ struct InstanceRow: View {
         session.phase == .idle || session.phase == .waitingForInput
     }
 
-    /// Whether text output was recent enough to display (within 2 seconds)
-    private var isTextOutputRecent: Bool {
-        guard let outputTime = session.lastTextOutputTime else { return false }
-        return Date().timeIntervalSince(outputTime) < 2.0
-    }
-
     /// Progress for chat button reveal (0 to 1)
     private var chatRevealProgress: CGFloat {
         guard swipeOffset > 0 else { return 0 }
@@ -230,69 +194,62 @@ struct InstanceRow: View {
     }
 
     var body: some View {
-        ZStack {
-            // Chat preview that fades in as you swipe right (behind main content)
-            if swipeOffset > 0 {
-                chatPreview
-                    .opacity(chatRevealProgress)
-            }
+        // Main content with swipe gestures
+        mainContent
+            .scaleEffect(swipeScale)
+            .offset(x: swipeOffset, y: swipeYOffset)
+            .gesture(
+                DragGesture(minimumDistance: 10)
+                    .onChanged { value in
+                        isDragging = true
+                        let translation = value.translation.width
+                        // Allow free movement in both directions
+                        if translation > 0 {
+                            // Swiping right (chat)
+                            swipeOffset = translation
+                        } else if canArchive {
+                            // Swiping left (archive)
+                            swipeOffset = translation
+                        }
+                    }
+                    .onEnded { value in
+                        isDragging = false
+                        let translation = value.translation.width
 
-            // Main content - fades out when swiping right, slides when swiping left
-            mainContent
-                .scaleEffect(swipeScale)
-                .offset(x: swipeOffset < 0 ? swipeOffset : 0, y: swipeYOffset)  // Only offset when swiping left
-                .opacity(swipeOffset > 0 ? (1.0 - chatRevealProgress * 0.9) : 1.0)  // Fade out when swiping right
-                .gesture(
-                    DragGesture(minimumDistance: 10)
-                        .onChanged { value in
-                            isDragging = true
-                            let translation = value.translation.width
-                            // Add resistance at edges
-                            if translation > 0 {
-                                // Swiping right (reveal chat) - with resistance
-                                swipeOffset = min(translation * 0.8, actionWidth + 30)
-                            } else if canArchive {
-                                // Swiping left (archive) - allow free movement
-                                swipeOffset = translation
+                        if translation > swipeThreshold {
+                            // Swiped right past threshold - vanish into top-right, open chat
+                            withAnimation(.easeIn(duration: 0.12)) {
+                                swipeOffset = 300
+                                swipeYOffset = -40
+                                swipeScale = 0.01
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                                onChat()
+                                // Reset after transition
+                                swipeOffset = 0
+                                swipeYOffset = 0
+                                swipeScale = 1.0
+                            }
+                        } else if translation < -swipeThreshold && canArchive {
+                            // Swiped left past threshold - vanish into top-left, archive
+                            withAnimation(.easeIn(duration: 0.12)) {
+                                swipeOffset = -300
+                                swipeYOffset = -40
+                                swipeScale = 0.01
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                                onArchive()
+                            }
+                        } else {
+                            // Didn't pass threshold - snap back
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                swipeOffset = 0
+                                swipeYOffset = 0
+                                swipeScale = 1.0
                             }
                         }
-                        .onEnded { value in
-                            isDragging = false
-                            let translation = value.translation.width
-
-                            if translation > swipeThreshold {
-                                // Swiped right past threshold - complete fade and open chat
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    swipeOffset = actionWidth + 40  // Fade out fully
-                                }
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                    onChat()
-                                    // Reset after transition
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                        swipeOffset = 0
-                                    }
-                                }
-                            } else if translation < -swipeThreshold && canArchive {
-                                // Swiped left past threshold - vanish into top-left
-                                withAnimation(.easeIn(duration: 0.12)) {
-                                    swipeOffset = -300
-                                    swipeYOffset = -40
-                                    swipeScale = 0.01
-                                }
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                                    onArchive()
-                                }
-                            } else {
-                                // Didn't pass threshold - snap back
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    swipeOffset = 0
-                                    swipeYOffset = 0
-                                    swipeScale = 1.0
-                                }
-                            }
-                        }
-                )
-        }
+                    }
+            )
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isWaitingForApproval)
         .onHover { isHovered = $0 }
@@ -403,7 +360,7 @@ struct InstanceRow: View {
                         font: .system(size: 11, weight: .medium)
                     )
                 } else if session.isThinking {
-                    // 4. Actively thinking - show thinking text in italics
+                    // 4. Actively thinking - show thinking text in italics with shimmer
                     if let thinkingText = session.lastThinkingText {
                         let cleaned = thinkingText.trimmingCharacters(in: .whitespacesAndNewlines)
                             .replacingOccurrences(of: "\n", with: " ")
@@ -412,69 +369,80 @@ struct InstanceRow: View {
                     } else {
                         ShimmerText(text: "Thinking...", font: .system(size: 11, weight: .medium).italic())
                     }
-                } else if session.phase == .processing, let textOutput = session.lastTextOutput, isTextOutputRecent {
-                    // 5. Recent text output - show for minimum 2 seconds
-                    ShimmerText(
-                        text: textOutput,
-                        font: .system(size: 11, weight: .medium)
-                    )
                 } else if session.phase == .processing, let thinkingText = session.lastThinkingText {
-                    // 6. Recent thinking (not actively thinking) - show in italics
+                    // 4b. Recent thinking during processing - show in italics (not actively thinking but have text)
                     let cleaned = thinkingText.trimmingCharacters(in: .whitespacesAndNewlines)
                         .replacingOccurrences(of: "\n", with: " ")
                     let truncated = cleaned.count > 60 ? String(cleaned.prefix(57)) + "..." : cleaned
                     ShimmerText(text: truncated, font: .system(size: 11, weight: .medium).italic())
+                } else if session.phase == .processing, let textOutput = session.lastTextOutput {
+                    // 5. Text output during processing
+                    Text(textOutput)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                        .lineLimit(1)
+                } else if session.phase == .waitingForInput, let textOutput = session.lastTextOutput {
+                    // 5b. Text output after turn ends - static orange (green dot indicates done)
+                    Text(textOutput)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(claudeOrange)
+                        .lineLimit(1)
                 } else if let todoActiveForm = session.currentTodoActiveForm {
-                    // 7. Show current todo task from status line
+                    // 6. Show current todo task from status line
                     ShimmerText(
                         text: "\(todoActiveForm)...",
                         font: .system(size: 11, weight: .medium)
                     )
-                } else if session.phase == .processing {
-                    // 8. Processing but no specific info - show fun transitional word
-                    ShimmerText(
-                        text: "\(funGerund(for: session.sessionId))...",
-                        font: .system(size: 11, weight: .medium)
-                    )
                 } else if let role = session.lastMessageRole {
-                    // 8. Fall back to last message (static - not processing)
+                    // 7. Fall back to last message (user's message at start, assistant's at end)
                     switch role {
                     case "tool":
-                        // Tool call - shimmer tool name + static input
-                        HStack(spacing: 4) {
-                            if let toolName = session.lastToolName {
-                                ShimmerText(
-                                    text: MCPToolFormatter.formatToolName(toolName),
-                                    font: .system(size: 11, weight: .medium),
-                                    color: claudeOrange
-                                )
-                            }
-                            if let input = session.lastMessage {
-                                Text(input)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.5))
-                                    .lineLimit(1)
+                        // Tool call - show tool name + input, shimmer during processing
+                        if session.phase == .processing {
+                            let toolName = session.lastToolName.map { MCPToolFormatter.formatToolName($0) } ?? "Tool"
+                            let display = session.lastMessage.map { "\(toolName): \($0)" } ?? "\(toolName)..."
+                            ShimmerText(
+                                text: display,
+                                font: .system(size: 11, weight: .medium)
+                            )
+                        } else {
+                            HStack(spacing: 4) {
+                                if let toolName = session.lastToolName {
+                                    Text(MCPToolFormatter.formatToolName(toolName))
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundColor(claudeOrange.opacity(0.8))
+                                }
+                                if let input = session.lastMessage {
+                                    Text(input)
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.white.opacity(0.5))
+                                        .lineLimit(1)
+                                }
                             }
                         }
                     case "user":
-                        // User message - prefix with "You:"
-                        HStack(spacing: 4) {
-                            Text("You:")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.white.opacity(0.5))
-                            if let msg = session.lastMessage {
-                                Text(msg)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.4))
-                                    .lineLimit(1)
-                            }
+                        // User message - show with shimmer during processing
+                        // Also show during waitingForInput if textOutput isn't ready yet (avoid blank)
+                        let showUserMessage = session.phase == .processing ||
+                            (session.phase == .waitingForInput && session.lastTextOutput == nil)
+                        if showUserMessage {
+                            ShimmerText(
+                                text: "You: \(session.lastMessage ?? "...")",
+                                font: .system(size: 11, weight: .medium)
+                            )
+                        } else if session.phase == .idle, let msg = session.lastMessage {
+                            // Static gray only for truly idle sessions
+                            Text(msg)
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.4))
+                                .lineLimit(1)
                         }
                     default:
                         // Assistant message - just show text
                         if let msg = session.lastMessage {
                             Text(msg)
                                 .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.4))
+                                .foregroundColor(.white.opacity(0.7))
                                 .lineLimit(1)
                         }
                     }
@@ -577,10 +545,6 @@ struct InstanceRow: View {
                 let truncated = singleLine.count > 50 ? String(singleLine.prefix(47)) + "..." : singleLine
                 return "\(name): \(truncated)"
             }
-        }
-        // For Bash with no command details, show a fun gerund instead of boring "Bash..."
-        if tool.name == "Bash" {
-            return "\(funGerund(for: session.sessionId))..."
         }
         return "\(name)..."
     }
