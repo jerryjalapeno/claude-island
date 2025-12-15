@@ -219,6 +219,8 @@ actor SessionStore {
 
         if event.event == "Stop" {
             session.subagentState = SubagentState()
+            // Clear any stale tools - they should all be done when turn ends
+            session.toolTracker = ToolTracker()
             // Stop is the authoritative signal that turn is done - set turnEndTime immediately
             // Don't wait for file sync/JSONL parsing which might have stale thinking state
             if session.turnEndTime == nil && session.conversationInfo.turnStartTime != nil {
